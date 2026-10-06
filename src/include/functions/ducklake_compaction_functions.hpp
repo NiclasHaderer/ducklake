@@ -50,12 +50,16 @@ public:
 	vector<Value> partition_values;
 	optional_idx row_id_start;
 	CompactionType type;
+	shared_ptr<DuckLakeCompactionReservation> reservation;
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
 		auto &child = planner.CreatePlan(*children[0]);
-		return planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
-		                                        partition_id, std::move(partition_values), row_id_start, child, type);
+		auto &result =
+		    planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
+		                                     partition_id, std::move(partition_values), row_id_start, child, type);
+		result.Cast<DuckLakeCompaction>().reservation = reservation;
+		return result;
 	}
 
 	string GetName() const override {
@@ -79,15 +83,51 @@ public:
 	}
 };
 
+class DuckLakeLogicalCompactionGate : public LogicalExtensionOperator {
+public:
+	explicit DuckLakeLogicalCompactionGate(shared_ptr<DuckLakeCompactionReservation> reservation)
+	    : reservation(std::move(reservation)) {
+	}
+
+	shared_ptr<DuckLakeCompactionReservation> reservation;
+
+public:
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
+		auto &scan = planner.CreatePlan(*children[0]);
+		if (scan.type != PhysicalOperatorType::TABLE_SCAN) {
+			throw InternalException("DuckLakeCompactionGate expects a table scan, got %s", scan.GetName());
+		}
+		return planner.Make<DuckLakeCompactionGate>(scan, reservation);
+	}
+
+	string GetName() const override {
+		return "DUCKLAKE_COMPACTION_GATE";
+	}
+
+	string GetExtensionName() const override {
+		return "ducklake";
+	}
+
+	vector<ColumnBinding> GetColumnBindings() override {
+		return children[0]->GetColumnBindings();
+	}
+
+	void ResolveTypes() override {
+		types = children[0]->types;
+	}
+};
+
 //===--------------------------------------------------------------------===//
 // Compaction Command Generator
 //===--------------------------------------------------------------------===//
 class DuckLakeCompactor {
 public:
 	DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
-	                  Binder &binder, TableIndex table_id, uint64_t max_files, DuckLakeMergeAdjacentOptions options);
+	                  Binder &binder, TableIndex table_id, uint64_t max_files, DuckLakeMergeAdjacentOptions options,
+	                  shared_ptr<DuckLakeCompactionAdmission> admission);
 	DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
-	                  Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold);
+	                  Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold,
+	                  shared_ptr<DuckLakeCompactionAdmission> admission);
 	void GenerateCompactions(DuckLakeTableEntry &table, vector<unique_ptr<LogicalOperator>> &compactions);
 	unique_ptr<LogicalOperator> GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry> source_files,
 	                                                      bool bind_to_latest_schema = false);
@@ -113,6 +153,7 @@ private:
 	uint64_t max_files;
 	double delete_threshold = 0.95;
 	DuckLakeMergeAdjacentOptions options;
+	shared_ptr<DuckLakeCompactionAdmission> admission;
 
 	CompactionType type;
 };

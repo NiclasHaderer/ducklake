@@ -89,6 +89,211 @@ DuckLakeCompaction::DuckLakeCompaction(PhysicalPlan &physical_plan, const vector
 }
 
 //===--------------------------------------------------------------------===//
+// Compaction Admission
+//===--------------------------------------------------------------------===//
+bool DuckLakeCompactionAdmission::TryAdmit(ClientContext &context, idx_t input_size,
+                                           const InterruptState &interrupt_state, idx_t &reservation) {
+	annotated_lock_guard<annotated_mutex> guard(lock);
+	auto required = LossyNumericCast<idx_t>(static_cast<double>(input_size) * memory_per_input_byte);
+	auto limit = BufferManager::GetBufferManager(context).GetMaxMemory();
+	if (running > 0 && interrupt_state.CanCallback() && (memory_per_input_byte == 0 || reserved + required > limit)) {
+		BlockTask(interrupt_state);
+		return false;
+	}
+	running++;
+	reserved += required;
+	reservation = required;
+	return true;
+}
+
+idx_t DuckLakeCompactionAdmission::Calibrate(double memory_per_input_byte_p, idx_t input_size, idx_t reservation) {
+	annotated_lock_guard<annotated_mutex> guard(lock);
+	if (memory_per_input_byte_p > memory_per_input_byte) {
+		memory_per_input_byte = memory_per_input_byte_p;
+		UnblockTasks();
+	}
+	auto required =
+	    MaxValue(reservation, LossyNumericCast<idx_t>(static_cast<double>(input_size) * memory_per_input_byte));
+	reserved += required - reservation;
+	return required;
+}
+
+void DuckLakeCompactionAdmission::Finish(idx_t reservation) {
+	annotated_lock_guard<annotated_mutex> guard(lock);
+	running--;
+	reserved -= reservation;
+	UnblockTasks();
+}
+
+DuckLakeCompactionReservation::DuckLakeCompactionReservation(shared_ptr<DuckLakeCompactionAdmission> admission_p,
+                                                             idx_t input_size, idx_t input_rows)
+    : input_rows(input_rows), admission(std::move(admission_p)), input_size(input_size) {
+}
+
+DuckLakeCompactionReservation::~DuckLakeCompactionReservation() {
+	Release();
+}
+
+void DuckLakeCompactionReservation::Reset() {
+	lock_guard<mutex> guard(lock);
+	ReleaseInternal();
+	admitted = false;
+	released = false;
+	reservation = 0;
+}
+
+bool DuckLakeCompactionReservation::Admit(ClientContext &context, const InterruptState &interrupt_state) {
+	lock_guard<mutex> guard(lock);
+	if (!admitted) {
+		admitted = admission->TryAdmit(context, input_size, interrupt_state, reservation);
+	}
+	return admitted;
+}
+
+void DuckLakeCompactionReservation::Calibrate(idx_t decoded_size, idx_t decoded_rows) {
+	// the sort holds the materialized input of the whole group and the copy holds row groups next to it while it
+	// encodes them; concurrent groups of wide rows, sorted or not, did not spill when each reserved twice its
+	// materialized size
+	static constexpr double MEMORY_PER_DECODED_BYTE = 2;
+	if (decoded_rows == 0 || input_size == 0) {
+		return;
+	}
+	auto decoded_group_size =
+	    static_cast<double>(decoded_size) * static_cast<double>(input_rows) / static_cast<double>(decoded_rows);
+	auto memory_per_input_byte = MEMORY_PER_DECODED_BYTE * decoded_group_size / static_cast<double>(input_size);
+	lock_guard<mutex> guard(lock);
+	if (admitted && !released) {
+		reservation = admission->Calibrate(memory_per_input_byte, input_size, reservation);
+	}
+}
+
+void DuckLakeCompactionReservation::Release() {
+	lock_guard<mutex> guard(lock);
+	ReleaseInternal();
+}
+
+void DuckLakeCompactionReservation::ReleaseInternal() {
+	if (admitted && !released) {
+		admission->Finish(reservation);
+	}
+	released = true;
+}
+
+//===--------------------------------------------------------------------===//
+// Compaction Gate
+//===--------------------------------------------------------------------===//
+DuckLakeCompactionGate::DuckLakeCompactionGate(PhysicalPlan &physical_plan, PhysicalOperator &scan,
+                                               shared_ptr<DuckLakeCompactionReservation> reservation)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, scan.types, scan.estimated_cardinality),
+      scan(scan), reservation(std::move(reservation)) {
+}
+
+class DuckLakeCompactionGateGlobalState : public GlobalSourceState {
+public:
+	explicit DuckLakeCompactionGateGlobalState(unique_ptr<GlobalSourceState> scan_state)
+	    : scan_state(std::move(scan_state)) {
+	}
+
+	idx_t MaxThreads() override {
+		return scan_state->MaxThreads();
+	}
+
+	unique_ptr<GlobalSourceState> scan_state;
+	atomic<idx_t> decoded_rows {0};
+	atomic<idx_t> decoded_size {0};
+	atomic<bool> calibrated {false};
+};
+
+class DuckLakeCompactionGateLocalState : public LocalSourceState {
+public:
+	//! Created once the group is admitted, a Parquet scan starts reading when it is initialized
+	unique_ptr<LocalSourceState> scan_state;
+	bool admitted = false;
+	//! Scanned vectors point into the decoded file instead of owning their strings, so the rows are materialized to
+	//! measure what the sort and the copy hold of them
+	unique_ptr<ColumnDataCollection> measured;
+	ColumnDataAppendState measure_state;
+	idx_t measured_size = 0;
+};
+
+unique_ptr<GlobalSourceState> DuckLakeCompactionGate::GetGlobalSourceState(ClientContext &context) const {
+	reservation->Reset();
+	return make_uniq<DuckLakeCompactionGateGlobalState>(scan.GetGlobalSourceState(context));
+}
+
+unique_ptr<GlobalSourceState>
+DuckLakeCompactionGate::GetGlobalSourceState(ClientContext &context,
+                                             const OperatorPartitionInfo &partition_info) const {
+	reservation->Reset();
+	return make_uniq<DuckLakeCompactionGateGlobalState>(scan.GetGlobalSourceState(context, partition_info));
+}
+
+unique_ptr<LocalSourceState> DuckLakeCompactionGate::GetLocalSourceState(ExecutionContext &context,
+                                                                         GlobalSourceState &gstate) const {
+	return make_uniq<DuckLakeCompactionGateLocalState>();
+}
+
+SourceResultType DuckLakeCompactionGate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                         OperatorSourceInput &input) const {
+	// the decoded size of this many rows is scaled to the whole group
+	static constexpr idx_t CALIBRATION_ROWS = 16 * STANDARD_VECTOR_SIZE;
+	auto &gstate = input.global_state.Cast<DuckLakeCompactionGateGlobalState>();
+	auto &lstate = input.local_state.Cast<DuckLakeCompactionGateLocalState>();
+	if (!lstate.admitted) {
+		if (!reservation->Admit(context.client, input.interrupt_state)) {
+			return SourceResultType::BLOCKED;
+		}
+		lstate.admitted = true;
+		lstate.scan_state = scan.GetLocalSourceState(context, *gstate.scan_state);
+	}
+	OperatorSourceInput scan_input {*gstate.scan_state, *lstate.scan_state, input.interrupt_state};
+	auto result = scan.GetData(context, chunk, scan_input);
+	input.batch_index_state = scan_input.batch_index_state;
+	if (gstate.calibrated) {
+		lstate.measured.reset();
+	} else if (chunk.size() > 0) {
+		if (!lstate.measured) {
+			lstate.measured = make_uniq<ColumnDataCollection>(BufferAllocator::Get(context.client), chunk.GetTypes());
+			lstate.measured->InitializeAppend(lstate.measure_state);
+		}
+		lstate.measured->Append(lstate.measure_state, chunk);
+		auto measured_size = lstate.measured->SizeInBytes();
+		auto size = gstate.decoded_size += measured_size - lstate.measured_size;
+		lstate.measured_size = measured_size;
+		auto rows = gstate.decoded_rows += chunk.size();
+		// a group that never reaches this, e.g. because deletes removed rows, holds back other groups until it finished
+		if (rows >= MinValue(reservation->input_rows, CALIBRATION_ROWS) && !gstate.calibrated.exchange(true)) {
+			reservation->Calibrate(size, rows);
+		}
+	}
+	return result;
+}
+
+OperatorPartitionData DuckLakeCompactionGate::GetPartitionData(ExecutionContext &context, DataChunk &chunk,
+                                                               GlobalSourceState &gstate, LocalSourceState &lstate,
+                                                               const OperatorPartitionInfo &partition_info) const {
+	auto &scan_gstate = *gstate.Cast<DuckLakeCompactionGateGlobalState>().scan_state;
+	auto &scan_lstate = *lstate.Cast<DuckLakeCompactionGateLocalState>().scan_state;
+	return scan.GetPartitionData(context, chunk, scan_gstate, scan_lstate, partition_info);
+}
+
+ProgressData DuckLakeCompactionGate::GetProgress(ClientContext &context, GlobalSourceState &gstate) const {
+	return scan.GetProgress(context, *gstate.Cast<DuckLakeCompactionGateGlobalState>().scan_state);
+}
+
+void DuckLakeCompactionGate::SourceFinished(ClientContext &context, GlobalSourceState &gstate) const {
+	scan.SourceFinished(context, *gstate.Cast<DuckLakeCompactionGateGlobalState>().scan_state);
+}
+
+string DuckLakeCompactionGate::GetName() const {
+	return "DUCKLAKE_COMPACTION_GATE";
+}
+
+InsertionOrderPreservingMap<string> DuckLakeCompactionGate::ParamsToString() const {
+	return scan.ParamsToString();
+}
+
+//===--------------------------------------------------------------------===//
 // Source State
 //===--------------------------------------------------------------------===//
 class DuckLakeCompactionSourceState : public GlobalSourceState {
@@ -147,6 +352,9 @@ SinkResultType DuckLakeCompaction::Sink(ExecutionContext &context, DataChunk &ch
 SinkFinalizeType DuckLakeCompaction::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                               OperatorSinkFinalizeInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
+	if (reservation) {
+		reservation->Release();
+	}
 
 	if (global_state.written_files.empty()) {
 		idx_t rows_to_write = 0;
@@ -191,15 +399,19 @@ string DuckLakeCompaction::GetName() const {
 
 DuckLakeCompactor::DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
                                      Binder &binder, TableIndex table_id, uint64_t max_files,
-                                     DuckLakeMergeAdjacentOptions options)
+                                     DuckLakeMergeAdjacentOptions options,
+                                     shared_ptr<DuckLakeCompactionAdmission> admission_p)
     : context(context), catalog(catalog), transaction(transaction), binder(binder), table_id(table_id),
-      max_files(max_files), options(options), type(CompactionType::MERGE_ADJACENT_TABLES) {
+      max_files(max_files), options(options), admission(std::move(admission_p)),
+      type(CompactionType::MERGE_ADJACENT_TABLES) {
 }
 
 DuckLakeCompactor::DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
-                                     Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold_p)
+                                     Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold_p,
+                                     shared_ptr<DuckLakeCompactionAdmission> admission_p)
     : context(context), catalog(catalog), transaction(transaction), binder(binder), table_id(table_id),
-      max_files(max_files), delete_threshold(delete_threshold_p), type(CompactionType::REWRITE_DELETES) {
+      max_files(max_files), delete_threshold(delete_threshold_p), admission(std::move(admission_p)),
+      type(CompactionType::REWRITE_DELETES) {
 }
 
 struct DuckLakeCompactionCandidates {
@@ -681,9 +893,18 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	// Resolve types so we can check if we need casts
 	ducklake_scan->ResolveOperatorTypes();
 
-	// Insert a cast projection if necessary
-	auto root = unique_ptr_cast<LogicalGet, LogicalOperator>(std::move(ducklake_scan));
+	idx_t input_size = 0;
+	idx_t input_rows = 0;
+	for (auto &source : actionable_source_files) {
+		input_size += source.file.data.file_size_bytes;
+		input_rows += source.file.row_count;
+	}
+	auto reservation = make_shared_ptr<DuckLakeCompactionReservation>(admission, input_size, input_rows);
+	unique_ptr<LogicalOperator> root = make_uniq<DuckLakeLogicalCompactionGate>(reservation);
+	root->children.push_back(std::move(ducklake_scan));
+	root->ResolveOperatorTypes();
 
+	// Insert a cast projection if necessary
 	if (DuckLakeTypes::RequiresCast(root->types)) {
 		root = DuckLakeInsert::InsertCasts(binder, root);
 	}
@@ -754,6 +975,7 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	auto compaction = make_uniq<DuckLakeLogicalCompaction>(
 	    binder.GenerateTableIndex(), table, std::move(actionable_source_files), std::move(copy_input.encryption_key),
 	    partition_id, std::move(partition_values), target_row_id_start, type);
+	compaction->reservation = std::move(reservation);
 	compaction->children.push_back(std::move(copy));
 	return std::move(compaction);
 }
@@ -794,7 +1016,8 @@ static void GenerateCompaction(ClientContext &context, DuckLakeTransaction &tran
                                DuckLakeCatalog &ducklake_catalog, TableFunctionBindInput &input,
                                DuckLakeTableEntry &cur_table, CompactionType type, double delete_threshold,
                                uint64_t max_files, optional_idx min_file_size, optional_idx max_file_size,
-                               const Value &newer_than, vector<unique_ptr<LogicalOperator>> &compactions) {
+                               const Value &newer_than, const shared_ptr<DuckLakeCompactionAdmission> &admission,
+                               vector<unique_ptr<LogicalOperator>> &compactions) {
 	switch (type) {
 	case CompactionType::MERGE_ADJACENT_TABLES: {
 		DuckLakeMergeAdjacentOptions options;
@@ -802,13 +1025,13 @@ static void GenerateCompaction(ClientContext &context, DuckLakeTransaction &tran
 		options.max_file_size = max_file_size;
 		options.newer_than = newer_than;
 		DuckLakeCompactor compactor(context, ducklake_catalog, transaction, *input.binder, cur_table.GetTableId(),
-		                            max_files, options);
+		                            max_files, options, admission);
 		compactor.GenerateCompactions(cur_table, compactions);
 		break;
 	}
 	case CompactionType::REWRITE_DELETES: {
 		DuckLakeCompactor compactor(context, ducklake_catalog, transaction, *input.binder, cur_table.GetTableId(),
-		                            max_files, delete_threshold);
+		                            max_files, delete_threshold, admission);
 		compactor.GenerateCompactions(cur_table, compactions);
 		break;
 	}
@@ -844,6 +1067,7 @@ unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableFunction
 	auto &transaction = DuckLakeTransaction::Get(context, ducklake_catalog);
 	string schema, table;
 	vector<unique_ptr<LogicalOperator>> compactions;
+	auto admission = make_shared_ptr<DuckLakeCompactionAdmission>();
 	uint64_t max_files = NumericLimits<uint64_t>::Maximum() - 1;
 	auto max_files_entry = input.named_parameters.find("max_compacted_files");
 	if (max_files_entry != input.named_parameters.end()) {
@@ -904,7 +1128,7 @@ unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableFunction
 						auto delete_threshold = GetDeleteThreshold(&dl_cur_schema, cur_table, ducklake_catalog, input);
 						GenerateCompaction(context, transaction, ducklake_catalog, input, cur_table, type,
 						                   delete_threshold, max_files, min_file_size, max_file_size, newer_than,
-						                   compactions);
+						                   admission, compactions);
 					}
 				}
 			});
@@ -940,7 +1164,7 @@ unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableFunction
 	if (auto_compact) {
 		auto delete_threshold = GetDeleteThreshold(dl_schema, ducklake_table, ducklake_catalog, input);
 		GenerateCompaction(context, transaction, ducklake_catalog, input, ducklake_table, type, delete_threshold,
-		                   max_files, min_file_size, max_file_size, newer_than, compactions);
+		                   max_files, min_file_size, max_file_size, newer_than, admission, compactions);
 	}
 
 	return GenerateCompactionOperator(input, bind_index, compactions);
