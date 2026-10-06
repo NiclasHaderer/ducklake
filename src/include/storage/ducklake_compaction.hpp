@@ -11,6 +11,7 @@
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/common/index_vector.hpp"
 #include "storage/ducklake_stats.hpp"
 #include "storage/ducklake_metadata_info.hpp"
@@ -21,97 +22,66 @@ class DuckLakeTableEntry;
 //! Shared by the compaction groups of one call. The groups run as union branches of one plan, and DuckDB starts the
 //! branches together unless a single branch can saturate all threads, which a group of wide rows never does. A group
 //! sorts or buffers its whole input before the copy writes it, so a group only starts once its memory fits in the
-//! memory limit next to the groups already running. Until a running group measured its memory, no further group
-//! starts. One group always runs, so a group that needs more than the memory limit still makes progress.
+//! memory limit next to the groups already running. The first group runs alone until it measured how much memory a
+//! group needs; one group always runs, so a group that needs more than the memory limit still makes progress.
 //! The temporary memory manager cannot decide this: every batch copy of the plan registers its full request when the
 //! query starts and keeps it until the query ends, so it reports no free memory long before memory runs out.
 class DuckLakeCompactionAdmission : public StateWithBlockableTasks {
 public:
-	//! Reserves the memory of a group with input_size bytes of input files, or blocks the task until a group
-	//! finished or measured its memory
-	bool TryAdmit(ClientContext &context, idx_t input_size, const InterruptState &interrupt_state, idx_t &reservation);
-	//! Raises the memory per input byte to a measured value and returns the grown reservation of a running group
-	idx_t Calibrate(double memory_per_input_byte_p, idx_t input_size, idx_t reservation);
+	//! Reserves the memory of a group with input_size bytes of input files. Blocks the task until a group finished or
+	//! the memory of a group is measured, unless interrupt_state is null because the task cannot be woken.
+	bool TryAdmit(ClientContext &context, idx_t input_size, optional_ptr<const InterruptState> interrupt_state,
+	              idx_t &reservation, bool &measure);
+	//! Sets the memory of a group as measured on the group that ran alone, returns the grown reservation of that group
+	idx_t Calibrate(idx_t fixed_memory_p, double memory_per_input_byte_p, idx_t input_size, idx_t reservation);
 	void Finish(idx_t reservation);
 
 private:
 	idx_t running DUCKDB_GUARDED_BY(lock) = 0;
 	idx_t reserved DUCKDB_GUARDED_BY(lock) = 0;
-	//! Memory per byte of input file, the largest any group measured. Decoded per encoded byte is far more alike
-	//! across tables than decoded bytes per row.
+	bool calibrated DUCKDB_GUARDED_BY(lock) = false;
+	//! A group needs fixed_memory plus memory_per_input_byte for every byte of its input files. Encoded bytes predict
+	//! the decoded size across tables far better than rows do.
+	idx_t fixed_memory DUCKDB_GUARDED_BY(lock) = 0;
 	double memory_per_input_byte DUCKDB_GUARDED_BY(lock) = 0;
 };
 
-//! The memory of one compaction group. The gate that scans its files admits it, the compaction that receives the
-//! written file releases it, as the copy holds the data until it wrote the file.
-class DuckLakeCompactionReservation {
+//! One compaction group. The scan of its files waits until the group is admitted, the compaction that receives the
+//! written file releases it, as the copy holds the data until it wrote the file. The group wraps the table function
+//! of the scan: an operator in the middle of a pipeline cannot block, but a table function can park its task.
+class DuckLakeCompactionGate {
 public:
-	DuckLakeCompactionReservation(shared_ptr<DuckLakeCompactionAdmission> admission, idx_t input_size,
-	                              idx_t input_rows);
-	~DuckLakeCompactionReservation();
+	DuckLakeCompactionGate(shared_ptr<DuckLakeCompactionAdmission> admission, idx_t input_size, idx_t input_rows);
+	~DuckLakeCompactionGate();
 
-	//! A prepared plan is executed again, the previous execution may have been cancelled before it released
-	void Reset();
-	bool Admit(ClientContext &context, const InterruptState &interrupt_state);
-	//! Scales the decoded size of the first rows of the group to the memory of the whole group
-	void Calibrate(idx_t decoded_size, idx_t decoded_rows);
+	static void WrapScan(TableFunction &scan, const shared_ptr<DuckLakeCompactionGate> &gate);
 	void Release();
 
-	const idx_t input_rows;
-
 private:
+	static unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &context, TableFunctionInitInput &input);
+	static void Scan(ClientContext &context, TableFunctionInput &input, DataChunk &output);
+	//! A prepared plan is executed again, the previous execution may have been cancelled before it released
+	void Reset();
+	bool Admit(ClientContext &context, const TableFunctionInput &input);
+	void Measure(ClientContext &context, idx_t rows);
 	void ReleaseInternal();
 
 	shared_ptr<DuckLakeCompactionAdmission> admission;
 	const idx_t input_size;
+	const idx_t input_rows;
+	table_function_init_global_t scan_init_global = nullptr;
+	table_function_t scan_function = nullptr;
+
 	mutex lock;
 	idx_t reservation = 0;
 	bool admitted = false;
 	bool released = false;
-};
-
-//! Scans the files of a compaction group once the group is admitted, see DuckLakeCompactionAdmission. An operator
-//! in the middle of a pipeline cannot block, so the gate is the source and runs the table scan itself.
-class DuckLakeCompactionGate : public PhysicalOperator {
-public:
-	DuckLakeCompactionGate(PhysicalPlan &physical_plan, PhysicalOperator &scan,
-	                       shared_ptr<DuckLakeCompactionReservation> reservation);
-
-	PhysicalOperator &scan;
-	shared_ptr<DuckLakeCompactionReservation> reservation;
-
-public:
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context,
-	                                                   const OperatorPartitionInfo &partition_info) const override;
-	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	                                                 GlobalSourceState &gstate) const override;
-	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-	                                 OperatorSourceInput &input) const override;
-	OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
-	                                       LocalSourceState &lstate,
-	                                       const OperatorPartitionInfo &partition_info) const override;
-	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
-	void SourceFinished(ClientContext &context, GlobalSourceState &gstate) const override;
-
-	bool IsSource() const override {
-		return true;
-	}
-	bool ParallelSource() const override {
-		return scan.ParallelSource();
-	}
-	TableFunctionParallelism SourceParallelism() const override {
-		return scan.SourceParallelism();
-	}
-	bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override {
-		return scan.SupportsPartitioning(partition_info);
-	}
-	OrderPreservationType SourceOrder() const override {
-		return scan.SourceOrder();
-	}
-
-	string GetName() const override;
-	InsertionOrderPreservingMap<string> ParamsToString() const override;
+	//! Set while the first group runs alone, the growth of the used memory is then its own
+	atomic<bool> measuring {false};
+	idx_t memory_at_admission = 0;
+	idx_t rows_scanned = 0;
+	idx_t sample_rows = 0;
+	idx_t sample_memory = 0;
 };
 
 class DuckLakeCompaction : public PhysicalOperator {
@@ -128,7 +98,7 @@ public:
 	vector<Value> partition_values;
 	optional_idx row_id_start;
 	CompactionType type;
-	shared_ptr<DuckLakeCompactionReservation> reservation;
+	shared_ptr<DuckLakeCompactionGate> gate;
 
 public:
 	// // Source interface

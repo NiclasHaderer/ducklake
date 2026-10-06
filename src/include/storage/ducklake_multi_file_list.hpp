@@ -52,6 +52,9 @@ public:
 	bool CanUseGlobalStats() const;
 	bool IsDeleteScan() const;
 	const DuckLakeDeleteScanEntry &GetDeleteScanEntry(idx_t file_idx);
+	DuckLakeFunctionInfo &GetFunctionInfo() const {
+		return read_info;
+	}
 
 protected:
 	//! Get the i-th expanded file

@@ -50,7 +50,7 @@ public:
 	vector<Value> partition_values;
 	optional_idx row_id_start;
 	CompactionType type;
-	shared_ptr<DuckLakeCompactionReservation> reservation;
+	shared_ptr<DuckLakeCompactionGate> gate;
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
@@ -58,7 +58,7 @@ public:
 		auto &result =
 		    planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
 		                                     partition_id, std::move(partition_values), row_id_start, child, type);
-		result.Cast<DuckLakeCompaction>().reservation = reservation;
+		result.Cast<DuckLakeCompaction>().gate = gate;
 		return result;
 	}
 
@@ -80,40 +80,6 @@ public:
 
 	void ResolveTypes() override {
 		types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
-	}
-};
-
-class DuckLakeLogicalCompactionGate : public LogicalExtensionOperator {
-public:
-	explicit DuckLakeLogicalCompactionGate(shared_ptr<DuckLakeCompactionReservation> reservation)
-	    : reservation(std::move(reservation)) {
-	}
-
-	shared_ptr<DuckLakeCompactionReservation> reservation;
-
-public:
-	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
-		auto &scan = planner.CreatePlan(*children[0]);
-		if (scan.type != PhysicalOperatorType::TABLE_SCAN) {
-			throw InternalException("DuckLakeCompactionGate expects a table scan, got %s", scan.GetName());
-		}
-		return planner.Make<DuckLakeCompactionGate>(scan, reservation);
-	}
-
-	string GetName() const override {
-		return "DUCKLAKE_COMPACTION_GATE";
-	}
-
-	string GetExtensionName() const override {
-		return "ducklake";
-	}
-
-	vector<ColumnBinding> GetColumnBindings() override {
-		return children[0]->GetColumnBindings();
-	}
-
-	void ResolveTypes() override {
-		types = children[0]->types;
 	}
 };
 

@@ -92,28 +92,31 @@ DuckLakeCompaction::DuckLakeCompaction(PhysicalPlan &physical_plan, const vector
 // Compaction Admission
 //===--------------------------------------------------------------------===//
 bool DuckLakeCompactionAdmission::TryAdmit(ClientContext &context, idx_t input_size,
-                                           const InterruptState &interrupt_state, idx_t &reservation) {
+                                           optional_ptr<const InterruptState> interrupt_state, idx_t &reservation,
+                                           bool &measure) {
 	annotated_lock_guard<annotated_mutex> guard(lock);
-	auto required = LossyNumericCast<idx_t>(static_cast<double>(input_size) * memory_per_input_byte);
+	auto required = fixed_memory + LossyNumericCast<idx_t>(static_cast<double>(input_size) * memory_per_input_byte);
 	auto limit = BufferManager::GetBufferManager(context).GetMaxMemory();
-	if (running > 0 && interrupt_state.CanCallback() && (memory_per_input_byte == 0 || reserved + required > limit)) {
-		BlockTask(interrupt_state);
+	if (running > 0 && interrupt_state && (!calibrated || reserved + required > limit)) {
+		BlockTask(*interrupt_state);
 		return false;
 	}
 	running++;
 	reserved += required;
 	reservation = required;
+	measure = !calibrated;
 	return true;
 }
 
-idx_t DuckLakeCompactionAdmission::Calibrate(double memory_per_input_byte_p, idx_t input_size, idx_t reservation) {
+idx_t DuckLakeCompactionAdmission::Calibrate(idx_t fixed_memory_p, double memory_per_input_byte_p, idx_t input_size,
+                                             idx_t reservation) {
 	annotated_lock_guard<annotated_mutex> guard(lock);
-	if (memory_per_input_byte_p > memory_per_input_byte) {
-		memory_per_input_byte = memory_per_input_byte_p;
-		UnblockTasks();
-	}
-	auto required =
-	    MaxValue(reservation, LossyNumericCast<idx_t>(static_cast<double>(input_size) * memory_per_input_byte));
+	fixed_memory = MaxValue(fixed_memory, fixed_memory_p);
+	memory_per_input_byte = MaxValue(memory_per_input_byte, memory_per_input_byte_p);
+	calibrated = true;
+	UnblockTasks();
+	auto required = fixed_memory + LossyNumericCast<idx_t>(static_cast<double>(input_size) * memory_per_input_byte);
+	required = MaxValue(required, reservation);
 	reserved += required - reservation;
 	return required;
 }
@@ -125,172 +128,123 @@ void DuckLakeCompactionAdmission::Finish(idx_t reservation) {
 	UnblockTasks();
 }
 
-DuckLakeCompactionReservation::DuckLakeCompactionReservation(shared_ptr<DuckLakeCompactionAdmission> admission_p,
-                                                             idx_t input_size, idx_t input_rows)
-    : input_rows(input_rows), admission(std::move(admission_p)), input_size(input_size) {
+//===--------------------------------------------------------------------===//
+// Compaction Group
+//===--------------------------------------------------------------------===//
+DuckLakeCompactionGate::DuckLakeCompactionGate(shared_ptr<DuckLakeCompactionAdmission> admission_p, idx_t input_size,
+                                               idx_t input_rows)
+    : admission(std::move(admission_p)), input_size(input_size), input_rows(input_rows) {
 }
 
-DuckLakeCompactionReservation::~DuckLakeCompactionReservation() {
+DuckLakeCompactionGate::~DuckLakeCompactionGate() {
 	Release();
 }
 
-void DuckLakeCompactionReservation::Reset() {
-	lock_guard<mutex> guard(lock);
-	ReleaseInternal();
-	admitted = false;
-	released = false;
-	reservation = 0;
+void DuckLakeCompactionGate::WrapScan(TableFunction &scan, const shared_ptr<DuckLakeCompactionGate> &gate) {
+	gate->scan_init_global = scan.init_global;
+	gate->scan_function = scan.function;
+	scan.init_global = InitGlobal;
+	scan.function = Scan;
+	scan.function_info->Cast<DuckLakeFunctionInfo>().compaction_gate = gate;
 }
 
-bool DuckLakeCompactionReservation::Admit(ClientContext &context, const InterruptState &interrupt_state) {
-	lock_guard<mutex> guard(lock);
-	if (!admitted) {
-		admitted = admission->TryAdmit(context, input_size, interrupt_state, reservation);
-	}
-	return admitted;
+static DuckLakeCompactionGate &GetCompactionGate(optional_ptr<const FunctionData> bind_data) {
+	auto &file_list = *bind_data->Cast<MultiFileBindData>().file_list;
+	return *file_list.Cast<DuckLakeMultiFileList>().GetFunctionInfo().compaction_gate;
 }
 
-void DuckLakeCompactionReservation::Calibrate(idx_t decoded_size, idx_t decoded_rows) {
-	// the sort holds the materialized input of the whole group and the copy holds row groups next to it while it
-	// encodes them; concurrent groups of wide rows, sorted or not, did not spill when each reserved twice its
-	// materialized size
-	static constexpr double MEMORY_PER_DECODED_BYTE = 2;
-	if (decoded_rows == 0 || input_size == 0) {
+unique_ptr<GlobalTableFunctionState> DuckLakeCompactionGate::InitGlobal(ClientContext &context,
+                                                                        TableFunctionInitInput &input) {
+	auto &gate = GetCompactionGate(input.bind_data);
+	gate.Reset();
+	return gate.scan_init_global(context, input);
+}
+
+void DuckLakeCompactionGate::Scan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &gate = GetCompactionGate(input.bind_data);
+	if (!gate.Admit(context, input)) {
+		input.async_result = AsyncResultType::BLOCKED;
 		return;
 	}
-	auto decoded_group_size =
-	    static_cast<double>(decoded_size) * static_cast<double>(input_rows) / static_cast<double>(decoded_rows);
-	auto memory_per_input_byte = MEMORY_PER_DECODED_BYTE * decoded_group_size / static_cast<double>(input_size);
-	lock_guard<mutex> guard(lock);
-	if (admitted && !released) {
-		reservation = admission->Calibrate(memory_per_input_byte, input_size, reservation);
-	}
+	gate.scan_function(context, input, output);
+	gate.Measure(context, output.size());
 }
 
-void DuckLakeCompactionReservation::Release() {
+void DuckLakeCompactionGate::Reset() {
+	lock_guard<mutex> guard(lock);
+	ReleaseInternal();
+	reservation = 0;
+	admitted = false;
+	released = false;
+	measuring = false;
+	rows_scanned = 0;
+	sample_rows = 0;
+}
+
+bool DuckLakeCompactionGate::Admit(ClientContext &context, const TableFunctionInput &input) {
+	lock_guard<mutex> guard(lock);
+	if (admitted) {
+		return true;
+	}
+	// a parked task is woken through its interrupt state, which a synchronous scan does not have
+	optional_ptr<const InterruptState> interrupt_state;
+	if (input.results_execution_mode != AsyncResultsExecutionMode::SYNCHRONOUS) {
+		interrupt_state = input.interrupt_state;
+	}
+	bool measure;
+	if (!admission->TryAdmit(context, input_size, interrupt_state, reservation, measure)) {
+		return false;
+	}
+	admitted = true;
+	memory_at_admission = BufferManager::GetBufferManager(context).GetUsedMemory();
+	measuring = measure;
+	return true;
+}
+
+void DuckLakeCompactionGate::Measure(ClientContext &context, idx_t rows) {
+	if (!measuring) {
+		return;
+	}
+	lock_guard<mutex> guard(lock);
+	if (!measuring || rows == 0) {
+		return;
+	}
+	// The group runs alone, so the growth of the used memory is its own. It is sampled twice: the memory per row
+	// between the samples is what the sort and the copy add for the data, the rest at the first sample is what the
+	// readers and the copy hold regardless of the data. A group that never reaches the second sample, e.g. because
+	// deletes removed rows, holds back the other groups until it finished.
+	rows_scanned += rows;
+	auto memory = BufferManager::GetBufferManager(context).GetUsedMemory();
+	if (sample_rows == 0) {
+		if (rows_scanned >= input_rows / 8) {
+			sample_rows = rows_scanned;
+			sample_memory = memory;
+		}
+		return;
+	}
+	if (rows_scanned < input_rows / 4 || rows_scanned == sample_rows) {
+		return;
+	}
+	measuring = false;
+	auto growth = memory > sample_memory ? memory - sample_memory : 0;
+	auto memory_per_row = static_cast<double>(growth) / static_cast<double>(rows_scanned - sample_rows);
+	auto data_memory = LossyNumericCast<idx_t>(memory_per_row * static_cast<double>(sample_rows));
+	auto sampled_memory = sample_memory > memory_at_admission ? sample_memory - memory_at_admission : 0;
+	auto fixed_memory = sampled_memory > data_memory ? sampled_memory - data_memory : 0;
+	auto memory_per_input_byte = memory_per_row * static_cast<double>(input_rows) / static_cast<double>(input_size);
+	reservation = admission->Calibrate(fixed_memory, memory_per_input_byte, input_size, reservation);
+}
+
+void DuckLakeCompactionGate::Release() {
 	lock_guard<mutex> guard(lock);
 	ReleaseInternal();
 }
 
-void DuckLakeCompactionReservation::ReleaseInternal() {
+void DuckLakeCompactionGate::ReleaseInternal() {
 	if (admitted && !released) {
 		admission->Finish(reservation);
 	}
 	released = true;
-}
-
-//===--------------------------------------------------------------------===//
-// Compaction Gate
-//===--------------------------------------------------------------------===//
-DuckLakeCompactionGate::DuckLakeCompactionGate(PhysicalPlan &physical_plan, PhysicalOperator &scan,
-                                               shared_ptr<DuckLakeCompactionReservation> reservation)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, scan.types, scan.estimated_cardinality),
-      scan(scan), reservation(std::move(reservation)) {
-}
-
-class DuckLakeCompactionGateGlobalState : public GlobalSourceState {
-public:
-	explicit DuckLakeCompactionGateGlobalState(unique_ptr<GlobalSourceState> scan_state)
-	    : scan_state(std::move(scan_state)) {
-	}
-
-	idx_t MaxThreads() override {
-		return scan_state->MaxThreads();
-	}
-
-	unique_ptr<GlobalSourceState> scan_state;
-	atomic<idx_t> decoded_rows {0};
-	atomic<idx_t> decoded_size {0};
-	atomic<bool> calibrated {false};
-};
-
-class DuckLakeCompactionGateLocalState : public LocalSourceState {
-public:
-	//! Created once the group is admitted, a Parquet scan starts reading when it is initialized
-	unique_ptr<LocalSourceState> scan_state;
-	bool admitted = false;
-	//! Scanned vectors point into the decoded file instead of owning their strings, so the rows are materialized to
-	//! measure what the sort and the copy hold of them
-	unique_ptr<ColumnDataCollection> measured;
-	ColumnDataAppendState measure_state;
-	idx_t measured_size = 0;
-};
-
-unique_ptr<GlobalSourceState> DuckLakeCompactionGate::GetGlobalSourceState(ClientContext &context) const {
-	reservation->Reset();
-	return make_uniq<DuckLakeCompactionGateGlobalState>(scan.GetGlobalSourceState(context));
-}
-
-unique_ptr<GlobalSourceState>
-DuckLakeCompactionGate::GetGlobalSourceState(ClientContext &context,
-                                             const OperatorPartitionInfo &partition_info) const {
-	reservation->Reset();
-	return make_uniq<DuckLakeCompactionGateGlobalState>(scan.GetGlobalSourceState(context, partition_info));
-}
-
-unique_ptr<LocalSourceState> DuckLakeCompactionGate::GetLocalSourceState(ExecutionContext &context,
-                                                                         GlobalSourceState &gstate) const {
-	return make_uniq<DuckLakeCompactionGateLocalState>();
-}
-
-SourceResultType DuckLakeCompactionGate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-                                                         OperatorSourceInput &input) const {
-	// the decoded size of this many rows is scaled to the whole group
-	static constexpr idx_t CALIBRATION_ROWS = 16 * STANDARD_VECTOR_SIZE;
-	auto &gstate = input.global_state.Cast<DuckLakeCompactionGateGlobalState>();
-	auto &lstate = input.local_state.Cast<DuckLakeCompactionGateLocalState>();
-	if (!lstate.admitted) {
-		if (!reservation->Admit(context.client, input.interrupt_state)) {
-			return SourceResultType::BLOCKED;
-		}
-		lstate.admitted = true;
-		lstate.scan_state = scan.GetLocalSourceState(context, *gstate.scan_state);
-	}
-	OperatorSourceInput scan_input {*gstate.scan_state, *lstate.scan_state, input.interrupt_state};
-	auto result = scan.GetData(context, chunk, scan_input);
-	input.batch_index_state = scan_input.batch_index_state;
-	if (gstate.calibrated) {
-		lstate.measured.reset();
-	} else if (chunk.size() > 0) {
-		if (!lstate.measured) {
-			lstate.measured = make_uniq<ColumnDataCollection>(BufferAllocator::Get(context.client), chunk.GetTypes());
-			lstate.measured->InitializeAppend(lstate.measure_state);
-		}
-		lstate.measured->Append(lstate.measure_state, chunk);
-		auto measured_size = lstate.measured->SizeInBytes();
-		auto size = gstate.decoded_size += measured_size - lstate.measured_size;
-		lstate.measured_size = measured_size;
-		auto rows = gstate.decoded_rows += chunk.size();
-		// a group that never reaches this, e.g. because deletes removed rows, holds back other groups until it finished
-		if (rows >= MinValue(reservation->input_rows, CALIBRATION_ROWS) && !gstate.calibrated.exchange(true)) {
-			reservation->Calibrate(size, rows);
-		}
-	}
-	return result;
-}
-
-OperatorPartitionData DuckLakeCompactionGate::GetPartitionData(ExecutionContext &context, DataChunk &chunk,
-                                                               GlobalSourceState &gstate, LocalSourceState &lstate,
-                                                               const OperatorPartitionInfo &partition_info) const {
-	auto &scan_gstate = *gstate.Cast<DuckLakeCompactionGateGlobalState>().scan_state;
-	auto &scan_lstate = *lstate.Cast<DuckLakeCompactionGateLocalState>().scan_state;
-	return scan.GetPartitionData(context, chunk, scan_gstate, scan_lstate, partition_info);
-}
-
-ProgressData DuckLakeCompactionGate::GetProgress(ClientContext &context, GlobalSourceState &gstate) const {
-	return scan.GetProgress(context, *gstate.Cast<DuckLakeCompactionGateGlobalState>().scan_state);
-}
-
-void DuckLakeCompactionGate::SourceFinished(ClientContext &context, GlobalSourceState &gstate) const {
-	scan.SourceFinished(context, *gstate.Cast<DuckLakeCompactionGateGlobalState>().scan_state);
-}
-
-string DuckLakeCompactionGate::GetName() const {
-	return "DUCKLAKE_COMPACTION_GATE";
-}
-
-InsertionOrderPreservingMap<string> DuckLakeCompactionGate::ParamsToString() const {
-	return scan.ParamsToString();
 }
 
 //===--------------------------------------------------------------------===//
@@ -352,8 +306,8 @@ SinkResultType DuckLakeCompaction::Sink(ExecutionContext &context, DataChunk &ch
 SinkFinalizeType DuckLakeCompaction::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                               OperatorSinkFinalizeInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	if (reservation) {
-		reservation->Release();
+	if (gate) {
+		gate->Release();
 	}
 
 	if (global_state.written_files.empty()) {
@@ -899,10 +853,9 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 		input_size += source.file.data.file_size_bytes;
 		input_rows += source.file.row_count;
 	}
-	auto reservation = make_shared_ptr<DuckLakeCompactionReservation>(admission, input_size, input_rows);
-	unique_ptr<LogicalOperator> root = make_uniq<DuckLakeLogicalCompactionGate>(reservation);
-	root->children.push_back(std::move(ducklake_scan));
-	root->ResolveOperatorTypes();
+	auto gate = make_shared_ptr<DuckLakeCompactionGate>(admission, input_size, input_rows);
+	DuckLakeCompactionGate::WrapScan(ducklake_scan->function, gate);
+	auto root = unique_ptr_cast<LogicalGet, LogicalOperator>(std::move(ducklake_scan));
 
 	// Insert a cast projection if necessary
 	if (DuckLakeTypes::RequiresCast(root->types)) {
@@ -975,7 +928,7 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	auto compaction = make_uniq<DuckLakeLogicalCompaction>(
 	    binder.GenerateTableIndex(), table, std::move(actionable_source_files), std::move(copy_input.encryption_key),
 	    partition_id, std::move(partition_values), target_row_id_start, type);
-	compaction->reservation = std::move(reservation);
+	compaction->gate = std::move(gate);
 	compaction->children.push_back(std::move(copy));
 	return std::move(compaction);
 }

@@ -39,6 +39,8 @@ unique_ptr<FunctionData> DuckLakeScanDeserialize(Deserializer &deserializer, Tab
 
 enum class DuckLakeScanType { SCAN_TABLE, SCAN_INSERTIONS, SCAN_DELETIONS, SCAN_FOR_FLUSH };
 
+class DuckLakeCompactionGate;
+
 struct DuckLakeFunctionInfo : public TableFunctionInfo {
 	DuckLakeFunctionInfo(DuckLakeTableEntry &table, DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot);
 
@@ -55,6 +57,8 @@ struct DuckLakeFunctionInfo : public TableFunctionInfo {
 	DuckLakeScanType scan_type = DuckLakeScanType::SCAN_TABLE;
 	//! Start snapshot - only set for DuckLakeScanType::SCAN_INSERTIONS and DuckLakeScanType::SCAN_DELETIONS
 	unique_ptr<DuckLakeSnapshot> start_snapshot;
+	//! Set for the scan of a compaction group, which waits until the group is admitted
+	shared_ptr<DuckLakeCompactionGate> compaction_gate;
 
 	shared_ptr<DuckLakeTransaction> GetTransaction();
 	bool CanUseGlobalStats();
