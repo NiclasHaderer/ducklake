@@ -866,9 +866,8 @@ static unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableF
 		tables = DuckLakeBaseMetadataFunction::GetTablesInScope(context, ducklake_catalog, schema, string());
 	}
 	// the catalog yields tables in hash order, which differs between platforms, and the groups are scheduled in order
-	std::sort(tables.begin(), tables.end(), [](DuckLakeTableEntry &a, DuckLakeTableEntry &b) {
-		return a.GetTableId() < b.GetTableId();
-	});
+	std::sort(tables.begin(), tables.end(),
+	          [](DuckLakeTableEntry &a, DuckLakeTableEntry &b) { return a.GetTableId() < b.GetTableId(); });
 	vector<unique_ptr<LogicalOperator>> compactions;
 	for (auto &table_ref : tables) {
 		auto &cur_table = table_ref.get();
