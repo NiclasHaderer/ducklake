@@ -20,7 +20,7 @@ statement ok
 CREATE VIEW schedule AS SELECT message FROM duckdb_logs WHERE message LIKE 'DuckLake compaction group%'
 
 # a BIGINT row and its snapshot id are estimated at 4 * 16 bytes, so 156250 rows are 10MB
-# the catalog compacts the tables in the order t4, t2, t3, t1, t0, with estimates of 60, 60, 30, 20 and 40MB
+# the tables are compacted in creation order, with estimates of 60, 60, 30, 20 and 40MB
 foreach table_name t0 t1 t2 t3 t4
 
 statement ok
@@ -34,19 +34,19 @@ CREATE MACRO batch(n) AS TABLE SELECT i FROM range(n) r(i)
 loop f 0 2
 
 statement ok
-INSERT INTO ducklake.t4 FROM batch(468750)
+INSERT INTO ducklake.t0 FROM batch(468750)
 
 statement ok
-INSERT INTO ducklake.t2 FROM batch(468750)
+INSERT INTO ducklake.t1 FROM batch(468750)
 
 statement ok
-INSERT INTO ducklake.t3 FROM batch(234375)
+INSERT INTO ducklake.t2 FROM batch(234375)
 
 statement ok
-INSERT INTO ducklake.t1 FROM batch(156250)
+INSERT INTO ducklake.t3 FROM batch(156250)
 
 statement ok
-INSERT INTO ducklake.t0 FROM batch(312500)
+INSERT INTO ducklake.t4 FROM batch(312500)
 
 endloop
 
@@ -71,16 +71,16 @@ t4	2
 statement ok
 ROLLBACK
 
-# t2 does not fit next to t4, t3 fits next to t2 but must still wait for t4, t1 does not fit next to t2 and t3,
-# t0 fits next to t3 and t1 but must still wait for t2
+# t1 does not fit next to t0, t2 fits next to t1 but must still wait for t0, t3 does not fit next to t1 and t2,
+# t4 fits next to t2 and t3 but must still wait for t1
 query I
 SELECT message FROM schedule ORDER BY message
 ----
-DuckLake compaction group 0 (t4): memory estimate 60000000, waits for none
-DuckLake compaction group 1 (t2): memory estimate 60000000, waits for 0
-DuckLake compaction group 2 (t3): memory estimate 30000000, waits for 0
-DuckLake compaction group 3 (t1): memory estimate 20000000, waits for 1
-DuckLake compaction group 4 (t0): memory estimate 40000000, waits for 1
+DuckLake compaction group 0 (t0): memory estimate 60000000, waits for none
+DuckLake compaction group 1 (t1): memory estimate 60000000, waits for 0
+DuckLake compaction group 2 (t2): memory estimate 30000000, waits for 0
+DuckLake compaction group 3 (t3): memory estimate 20000000, waits for 1
+DuckLake compaction group 4 (t4): memory estimate 40000000, waits for 1
 
 # executing the prepared plan again schedules from scratch
 statement ok
@@ -98,11 +98,11 @@ t4	2
 query I
 SELECT message FROM schedule ORDER BY message
 ----
-DuckLake compaction group 0 (t4): memory estimate 60000000, waits for none
-DuckLake compaction group 1 (t2): memory estimate 60000000, waits for 0
-DuckLake compaction group 2 (t3): memory estimate 30000000, waits for 0
-DuckLake compaction group 3 (t1): memory estimate 20000000, waits for 1
-DuckLake compaction group 4 (t0): memory estimate 40000000, waits for 1
+DuckLake compaction group 0 (t0): memory estimate 60000000, waits for none
+DuckLake compaction group 1 (t1): memory estimate 60000000, waits for 0
+DuckLake compaction group 2 (t2): memory estimate 30000000, waits for 0
+DuckLake compaction group 3 (t3): memory estimate 20000000, waits for 1
+DuckLake compaction group 4 (t4): memory estimate 40000000, waits for 1
 
 statement ok
 RESET memory_limit

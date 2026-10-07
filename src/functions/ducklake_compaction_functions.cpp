@@ -96,10 +96,9 @@ void DuckLakeCompactionUnion::BuildPipelines(Pipeline &current, MetaPipeline &me
 	// so this also waits for all groups before it.
 	optional_idx finished_group;
 	for (auto &child : children) {
-		D_ASSERT(child->GetName() == "DUCKLAKE_COMPACTION");
 		auto &compaction = child.get().Cast<DuckLakeCompaction>();
 		const auto entry = groups.find(compaction);
-		D_ASSERT(entry == groups.end());
+		D_ASSERT(entry != groups.end());
 		auto &group = entry->second.get();
 		while (!running.empty() && running_memory + compaction.memory_estimate > memory_limit) {
 			finished_group = running.front().first;
@@ -866,6 +865,10 @@ static unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableF
 	} else {
 		tables = DuckLakeBaseMetadataFunction::GetTablesInScope(context, ducklake_catalog, schema, string());
 	}
+	// the catalog yields tables in hash order, which differs between platforms, and the groups are scheduled in order
+	std::sort(tables.begin(), tables.end(), [](DuckLakeTableEntry &a, DuckLakeTableEntry &b) {
+		return a.GetTableId() < b.GetTableId();
+	});
 	vector<unique_ptr<LogicalOperator>> compactions;
 	for (auto &table_ref : tables) {
 		auto &cur_table = table_ref.get();
