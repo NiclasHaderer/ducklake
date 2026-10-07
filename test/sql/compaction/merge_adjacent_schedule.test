@@ -1,0 +1,145 @@
+# name: test/sql/compaction/merge_adjacent_schedule.test
+# description: merge_adjacent_files only starts a compaction group once its memory estimate fits next to the groups that may still run
+# group: [compaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+CALL enable_logging(level = 'debug')
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/merge_adjacent_schedule', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE VIEW schedule AS SELECT message FROM duckdb_logs WHERE message LIKE 'DuckLake compaction group%'
+
+# a BIGINT row and its snapshot id are estimated at 4 * 16 bytes, so 156250 rows are 10MB
+# the catalog compacts the tables in the order t4, t2, t3, t1, t0, with estimates of 60, 60, 30, 20 and 40MB
+foreach table_name t0 t1 t2 t3 t4
+
+statement ok
+CREATE TABLE ducklake.{table_name} (i BIGINT)
+
+endloop
+
+statement ok
+CREATE MACRO batch(n) AS TABLE SELECT i FROM range(n) r(i)
+
+loop f 0 2
+
+statement ok
+INSERT INTO ducklake.t4 FROM batch(468750)
+
+statement ok
+INSERT INTO ducklake.t2 FROM batch(468750)
+
+statement ok
+INSERT INTO ducklake.t3 FROM batch(234375)
+
+statement ok
+INSERT INTO ducklake.t1 FROM batch(156250)
+
+statement ok
+INSERT INTO ducklake.t0 FROM batch(312500)
+
+endloop
+
+statement ok
+SET memory_limit = '100MB'
+
+statement ok
+PREPARE compact AS SELECT table_name, files_processed FROM ducklake_merge_adjacent_files('ducklake') ORDER BY ALL
+
+statement ok
+BEGIN
+
+query II
+EXECUTE compact
+----
+t0	2
+t1	2
+t2	2
+t3	2
+t4	2
+
+statement ok
+ROLLBACK
+
+# t2 does not fit next to t4, t3 fits next to t2 but must still wait for t4, t1 does not fit next to t2 and t3,
+# t0 fits next to t3 and t1 but must still wait for t2
+query I
+SELECT message FROM schedule ORDER BY message
+----
+DuckLake compaction group 0 (t4): memory estimate 60000000, waits for none
+DuckLake compaction group 1 (t2): memory estimate 60000000, waits for 0
+DuckLake compaction group 2 (t3): memory estimate 30000000, waits for 0
+DuckLake compaction group 3 (t1): memory estimate 20000000, waits for 1
+DuckLake compaction group 4 (t0): memory estimate 40000000, waits for 1
+
+# executing the prepared plan again schedules from scratch
+statement ok
+CALL truncate_duckdb_logs()
+
+query II
+EXECUTE compact
+----
+t0	2
+t1	2
+t2	2
+t3	2
+t4	2
+
+query I
+SELECT message FROM schedule ORDER BY message
+----
+DuckLake compaction group 0 (t4): memory estimate 60000000, waits for none
+DuckLake compaction group 1 (t2): memory estimate 60000000, waits for 0
+DuckLake compaction group 2 (t3): memory estimate 30000000, waits for 0
+DuckLake compaction group 3 (t1): memory estimate 20000000, waits for 1
+DuckLake compaction group 4 (t0): memory estimate 40000000, waits for 1
+
+statement ok
+RESET memory_limit
+
+statement ok
+CALL truncate_duckdb_logs()
+
+# a map is estimated by the number of its entries: 4 * (8 + 16 + 20 * (16 + 5 + 8) + 8) bytes per row
+statement ok
+CREATE TABLE ducklake.maps (i BIGINT, m MAP(VARCHAR, BIGINT))
+
+# strings longer than their truncated min and max are estimated by 4 * 10 times their file bytes
+statement ok
+CREATE TABLE ducklake.strings (s VARCHAR)
+
+loop f 0 2
+
+statement ok
+INSERT INTO ducklake.maps SELECT i, map_from_entries([('key_' || j, i * j) for j in range(20)]) FROM range(1000) r(i)
+
+statement ok
+INSERT INTO ducklake.strings SELECT md5(i::VARCHAR) || md5((i + 1)::VARCHAR) || md5((i + 2)::VARCHAR) || md5((i + 3)::VARCHAR) || md5((i + 4)::VARCHAR) || md5((i + 5)::VARCHAR) || md5((i + 6)::VARCHAR) || md5((i + 7)::VARCHAR) || md5((i + 8)::VARCHAR) FROM range(1000) r(i)
+
+endloop
+
+statement ok
+CREATE TABLE string_file_bytes AS SELECT sum(data_file_size_bytes) AS bytes FROM ducklake_list_files('ducklake', 'strings')
+
+statement ok
+SELECT * FROM ducklake_merge_adjacent_files('ducklake')
+
+query I
+SELECT regexp_extract(message, 'memory estimate (\d+)', 1) FROM schedule WHERE message LIKE '%(maps)%'
+----
+4896000
+
+query I
+SELECT regexp_extract(message, 'memory estimate (\d+)', 1)::UBIGINT = 40 * bytes FROM schedule, string_file_bytes WHERE message LIKE '%(strings)%'
+----
+true

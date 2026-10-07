@@ -29,6 +29,7 @@
 #include "duckdb/common/deque.hpp"
 #include "duckdb/common/reference_map.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 
 namespace duckdb {
@@ -97,13 +98,15 @@ void DuckLakeCompactionUnion::BuildPipelines(Pipeline &current, MetaPipeline &me
 	for (auto &child : meta_pipeline.GetChildren()) {
 		groups.emplace(*child->GetSink(), *child);
 	}
-	const auto memory_limit = BufferManager::GetBufferManager(meta_pipeline.GetExecutor().context).GetMaxMemory();
-	deque<pair<shared_ptr<Pipeline>, idx_t>> running;
+	auto &context = meta_pipeline.GetExecutor().context;
+	const auto memory_limit = BufferManager::GetBufferManager(context).GetMaxMemory();
+	vector<shared_ptr<Pipeline>> last_pipelines;
+	// the index and memory estimate of the groups that may run when the next group starts
+	deque<pair<idx_t, idx_t>> running;
 	idx_t running_memory = 0;
 	// Every group waits for the last group removed from running. The last pipelines of the groups complete in order,
 	// so this also waits for all groups before it.
-	shared_ptr<Pipeline> finished_pipeline;
-	shared_ptr<Pipeline> previous_pipeline;
+	optional_idx finished_group;
 	for (auto &child : children) {
 		D_ASSERT(child->GetName() == "DUCKLAKE_COMPACTION");
 		auto &compaction = child.get().Cast<DuckLakeCompaction>();
@@ -111,24 +114,29 @@ void DuckLakeCompactionUnion::BuildPipelines(Pipeline &current, MetaPipeline &me
 		D_ASSERT(entry == groups.end());
 		auto &group = entry->second.get();
 		while (!running.empty() && running_memory + compaction.memory_estimate > memory_limit) {
-			finished_pipeline = running.front().first;
+			finished_group = running.front().first;
 			running_memory -= running.front().second;
 			running.pop_front();
 		}
-		if (finished_pipeline) {
+		DUCKDB_LOG_DEBUG(
+		    context, StringUtil::Format(
+		                 "DuckLake compaction group %d (%s): memory estimate %d, waits for %s", last_pipelines.size(),
+		                 compaction.table.name.GetIdentifierName(), compaction.memory_estimate,
+		                 finished_group.IsValid() ? to_string(finished_group.GetIndex()) : string("none")));
+		if (finished_group.IsValid()) {
 			vector<shared_ptr<Pipeline>> pipelines;
 			group.GetPipelines(pipelines, true);
 			for (auto &pipeline : pipelines) {
-				pipeline->AddDependency(finished_pipeline);
+				pipeline->AddDependency(last_pipelines[finished_group.GetIndex()]);
 			}
 		}
 		auto &last_pipeline = group.GetBasePipeline();
-		if (previous_pipeline) {
-			last_pipeline->AddDependency(previous_pipeline);
+		if (!last_pipelines.empty()) {
+			last_pipeline->AddDependency(last_pipelines.back());
 		}
-		previous_pipeline = last_pipeline;
-		running.emplace_back(last_pipeline, compaction.memory_estimate);
+		running.emplace_back(last_pipelines.size(), compaction.memory_estimate);
 		running_memory += compaction.memory_estimate;
+		last_pipelines.push_back(last_pipeline);
 	}
 }
 
