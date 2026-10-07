@@ -20,7 +20,6 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
-#include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "storage/ducklake_compaction.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
@@ -70,14 +69,14 @@ public:
 	}
 
 	vector<ColumnBinding> GetColumnBindings() override {
-		return GenerateColumnBindings(table_index, ResultTypes().size());
+		return GenerateColumnBindings(table_index, GetResultTypes().size());
 	}
 
 	void ResolveTypes() override {
-		types = ResultTypes();
+		types = GetResultTypes();
 	}
 
-	static vector<LogicalType> ResultTypes() {
+	static vector<LogicalType> GetResultTypes() {
 		return {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
 	}
 };
@@ -108,11 +107,11 @@ public:
 		return "ducklake";
 	}
 	vector<ColumnBinding> GetColumnBindings() override {
-		return GenerateColumnBindings(table_index, DuckLakeLogicalCompaction::ResultTypes().size());
+		return GenerateColumnBindings(table_index, DuckLakeLogicalCompaction::GetResultTypes().size());
 	}
 
 	void ResolveTypes() override {
-		types = DuckLakeLogicalCompaction::ResultTypes();
+		types = DuckLakeLogicalCompaction::GetResultTypes();
 	}
 };
 
@@ -129,13 +128,19 @@ public:
 	unique_ptr<LogicalOperator> GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry> source_files,
 	                                                      bool bind_to_latest_schema = false);
 	static unique_ptr<LogicalOperator> InsertSort(Binder &binder, unique_ptr<LogicalOperator> &plan,
-	                                              DuckLakeTableEntry &table, optional_ptr<DuckLakeSort> sort_data,
-	                                              bool add_tiebreakers = false);
+	                                              DuckLakeTableEntry &table, optional_ptr<DuckLakeSort> sort_data);
 	static vector<OrderByNode> ParseSortOrders(const DuckLakeSort &sort_data);
 	//! Bind ORDER BY expressions against a column list + table name (works before a table entry exists).
 	static vector<BoundOrderByNode> BindSortOrders(Binder &binder, const ColumnList &columns,
 	                                               const Identifier &table_name, TableIndex table_index,
-	                                               vector<OrderByNode> &pre_bound_orders);
+	                                               const vector<OrderByNode> &pre_bound_orders);
+	static DuckLakeTableEntry &GetLatestTableEntry(DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
+	                                               const DuckLakeTableEntry &table);
+	static unique_ptr<LogicalOperator>
+	PlanRewriteScan(ClientContext &context, Binder &binder, DuckLakeTableEntry &table, DuckLakeCopyInput &copy_input,
+	                bool write_row_id, bool write_snapshot_id,
+	                const std::function<unique_ptr<DuckLakeMultiFileList>(DuckLakeFunctionInfo &)> &create_file_list,
+	                unique_ptr<LogicalCopyToFile> &copy);
 
 private:
 	optional_ptr<DuckLakeTableEntry> ResolvePartitionSpecTable(DuckLakeTableEntry &table,
