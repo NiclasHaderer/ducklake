@@ -31,6 +31,8 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parallel/meta_pipeline.hpp"
+#include "duckdb/parallel/pipeline.hpp"
 
 namespace duckdb {
 
@@ -86,6 +88,46 @@ DuckLakeCompaction::DuckLakeCompaction(PhysicalPlan &physical_plan, const vector
       source_files(std::move(source_files_p)), encryption_key(std::move(encryption_key_p)), partition_id(partition_id),
       partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type) {
 	children.push_back(child);
+}
+
+void DuckLakeCompaction::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+	PhysicalOperator::BuildPipelines(current, meta_pipeline);
+	auto &group = *meta_pipeline.GetChildren().back();
+	schedule->AddGroup(meta_pipeline.GetExecutor().context, group, group_index, memory_estimate);
+}
+
+//===--------------------------------------------------------------------===//
+// Compaction Schedule
+//===--------------------------------------------------------------------===//
+void DuckLakeCompactionSchedule::AddGroup(ClientContext &context, MetaPipeline &group, idx_t group_index,
+                                          idx_t memory_estimate) {
+	if (group_index == 0) {
+		running.clear();
+		running_memory = 0;
+		previous_last_pipeline.reset();
+	}
+	auto memory_limit = BufferManager::GetBufferManager(context).GetMaxMemory();
+	shared_ptr<Pipeline> finished_pipeline;
+	while (!running.empty() && running_memory + memory_estimate > memory_limit) {
+		finished_pipeline = running.front().last_pipeline.lock();
+		running_memory -= running.front().memory_estimate;
+		running.pop_front();
+	}
+	if (finished_pipeline) {
+		vector<shared_ptr<Pipeline>> pipelines;
+		group.GetPipelines(pipelines, true);
+		for (auto &pipeline : pipelines) {
+			pipeline->AddDependency(finished_pipeline);
+		}
+	}
+	auto &last_pipeline = group.GetBasePipeline();
+	auto previous = previous_last_pipeline.lock();
+	if (previous) {
+		last_pipeline->AddDependency(previous);
+	}
+	previous_last_pipeline = last_pipeline;
+	running.push_back({last_pipeline, memory_estimate});
+	running_memory += memory_estimate;
 }
 
 //===--------------------------------------------------------------------===//
@@ -191,15 +233,19 @@ string DuckLakeCompaction::GetName() const {
 
 DuckLakeCompactor::DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
                                      Binder &binder, TableIndex table_id, uint64_t max_files,
-                                     DuckLakeMergeAdjacentOptions options)
+                                     DuckLakeMergeAdjacentOptions options,
+                                     shared_ptr<DuckLakeCompactionSchedule> schedule_p)
     : context(context), catalog(catalog), transaction(transaction), binder(binder), table_id(table_id),
-      max_files(max_files), options(options), type(CompactionType::MERGE_ADJACENT_TABLES) {
+      max_files(max_files), options(options), schedule(std::move(schedule_p)),
+      type(CompactionType::MERGE_ADJACENT_TABLES) {
 }
 
 DuckLakeCompactor::DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
-                                     Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold_p)
+                                     Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold_p,
+                                     shared_ptr<DuckLakeCompactionSchedule> schedule_p)
     : context(context), catalog(catalog), transaction(transaction), binder(binder), table_id(table_id),
-      max_files(max_files), delete_threshold(delete_threshold_p), type(CompactionType::REWRITE_DELETES) {
+      max_files(max_files), delete_threshold(delete_threshold_p), schedule(std::move(schedule_p)),
+      type(CompactionType::REWRITE_DELETES) {
 }
 
 struct DuckLakeCompactionCandidates {
@@ -527,6 +573,32 @@ DuckLakeCompactor::ResolvePartitionSpecTable(DuckLakeTableEntry &table, const Du
 	return &partition_table;
 }
 
+//! A group peaks at up to 3.5x the in-memory size of its rows while its sort or copy holds them
+static constexpr idx_t MEMORY_PER_ROW_BYTE = 4;
+
+//! Strings are estimated at the average length of the column's min and max, the leaves of a list or map at the number
+//! of values they have in the file
+static idx_t EstimateColumnSize(const DuckLakeFieldId &field_id, idx_t value_count,
+                                const DuckLakeCompactionFileData &file, optional_ptr<DuckLakeTableStats> table_stats) {
+	auto list_value_count = file.list_value_counts.find(field_id.GetFieldIndex());
+	if (list_value_count != file.list_value_counts.end()) {
+		value_count = list_value_count->second;
+	}
+	auto physical_type = field_id.Type().InternalType();
+	idx_t width = GetTypeIdSize(physical_type);
+	if (physical_type == PhysicalType::VARCHAR && table_stats) {
+		auto column_stats = table_stats->column_stats.find(field_id.GetFieldIndex());
+		if (column_stats != table_stats->column_stats.end()) {
+			width += (column_stats->second.min.size() + column_stats->second.max.size()) / 2;
+		}
+	}
+	idx_t size = value_count * width;
+	for (auto &child : field_id.Children()) {
+		size += EstimateColumnSize(*child, value_count, file, table_stats);
+	}
+	return size;
+}
+
 unique_ptr<LogicalOperator>
 DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry> source_files,
                                              bool bind_to_latest_schema) {
@@ -681,9 +753,20 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	// Resolve types so we can check if we need casts
 	ducklake_scan->ResolveOperatorTypes();
 
-	// Insert a cast projection if necessary
+	auto table_stats = table.GetTableStats(transaction);
+	auto virtual_column_count = column_ids.size() - columns.PhysicalColumnCount();
+	idx_t memory_size = 0;
+	idx_t file_size = 0;
+	for (auto &source : actionable_source_files) {
+		memory_size += source.file.row_count * virtual_column_count * sizeof(int64_t);
+		for (auto &field_id : table.GetFieldData().GetFieldIds()) {
+			memory_size += EstimateColumnSize(*field_id, source.file.row_count, source.file, table_stats.get());
+		}
+		file_size += source.file.data.file_size_bytes;
+	}
 	auto root = unique_ptr_cast<LogicalGet, LogicalOperator>(std::move(ducklake_scan));
 
+	// Insert a cast projection if necessary
 	if (DuckLakeTypes::RequiresCast(root->types)) {
 		root = DuckLakeInsert::InsertCasts(binder, root);
 	}
@@ -754,6 +837,8 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	auto compaction = make_uniq<DuckLakeLogicalCompaction>(
 	    binder.GenerateTableIndex(), table, std::move(actionable_source_files), std::move(copy_input.encryption_key),
 	    partition_id, std::move(partition_values), target_row_id_start, type);
+	compaction->schedule = schedule;
+	compaction->memory_estimate = MEMORY_PER_ROW_BYTE * MaxValue(memory_size, file_size);
 	compaction->children.push_back(std::move(copy));
 	return std::move(compaction);
 }
@@ -781,6 +866,9 @@ static unique_ptr<LogicalOperator> GenerateCompactionOperator(TableFunctionBindI
 		compactions[0]->Cast<DuckLakeLogicalCompaction>().table_index = bind_index;
 		return std::move(compactions[0]);
 	}
+	for (idx_t group_index = 0; group_index < compactions.size(); group_index++) {
+		compactions[group_index]->Cast<DuckLakeLogicalCompaction>().group_index = group_index;
+	}
 	auto union_op = input.binder->UnionOperators(std::move(compactions));
 	auto &set_op = union_op->Cast<LogicalSetOperation>();
 	set_op.table_index = bind_index;
@@ -794,7 +882,8 @@ static void GenerateCompaction(ClientContext &context, DuckLakeTransaction &tran
                                DuckLakeCatalog &ducklake_catalog, TableFunctionBindInput &input,
                                DuckLakeTableEntry &cur_table, CompactionType type, double delete_threshold,
                                uint64_t max_files, optional_idx min_file_size, optional_idx max_file_size,
-                               const Value &newer_than, vector<unique_ptr<LogicalOperator>> &compactions) {
+                               const Value &newer_than, const shared_ptr<DuckLakeCompactionSchedule> &schedule,
+                               vector<unique_ptr<LogicalOperator>> &compactions) {
 	switch (type) {
 	case CompactionType::MERGE_ADJACENT_TABLES: {
 		DuckLakeMergeAdjacentOptions options;
@@ -802,13 +891,13 @@ static void GenerateCompaction(ClientContext &context, DuckLakeTransaction &tran
 		options.max_file_size = max_file_size;
 		options.newer_than = newer_than;
 		DuckLakeCompactor compactor(context, ducklake_catalog, transaction, *input.binder, cur_table.GetTableId(),
-		                            max_files, options);
+		                            max_files, options, schedule);
 		compactor.GenerateCompactions(cur_table, compactions);
 		break;
 	}
 	case CompactionType::REWRITE_DELETES: {
 		DuckLakeCompactor compactor(context, ducklake_catalog, transaction, *input.binder, cur_table.GetTableId(),
-		                            max_files, delete_threshold);
+		                            max_files, delete_threshold, schedule);
 		compactor.GenerateCompactions(cur_table, compactions);
 		break;
 	}
@@ -844,6 +933,7 @@ unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableFunction
 	auto &transaction = DuckLakeTransaction::Get(context, ducklake_catalog);
 	string schema, table;
 	vector<unique_ptr<LogicalOperator>> compactions;
+	auto schedule = make_shared_ptr<DuckLakeCompactionSchedule>();
 	uint64_t max_files = NumericLimits<uint64_t>::Maximum() - 1;
 	auto max_files_entry = input.named_parameters.find("max_compacted_files");
 	if (max_files_entry != input.named_parameters.end()) {
@@ -904,7 +994,7 @@ unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableFunction
 						auto delete_threshold = GetDeleteThreshold(&dl_cur_schema, cur_table, ducklake_catalog, input);
 						GenerateCompaction(context, transaction, ducklake_catalog, input, cur_table, type,
 						                   delete_threshold, max_files, min_file_size, max_file_size, newer_than,
-						                   compactions);
+						                   schedule, compactions);
 					}
 				}
 			});
@@ -940,7 +1030,7 @@ unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableFunction
 	if (auto_compact) {
 		auto delete_threshold = GetDeleteThreshold(dl_schema, ducklake_table, ducklake_catalog, input);
 		GenerateCompaction(context, transaction, ducklake_catalog, input, ducklake_table, type, delete_threshold,
-		                   max_files, min_file_size, max_file_size, newer_than, compactions);
+		                   max_files, min_file_size, max_file_size, newer_than, schedule, compactions);
 	}
 
 	return GenerateCompactionOperator(input, bind_index, compactions);

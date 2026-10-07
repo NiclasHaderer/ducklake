@@ -472,6 +472,8 @@ struct DuckLakeCompactionFileData : public DuckLakeCompactionBaseFileData {
 	MappingIndex mapping_id;
 	optional_idx partition_id;
 	vector<Value> partition_values;
+	//! The number of values of each leaf column inside a list or map
+	map<FieldIndex, idx_t> list_value_counts;
 };
 
 struct DuckLakeCompactionDeleteFileData : public DuckLakeCompactionBaseFileData {

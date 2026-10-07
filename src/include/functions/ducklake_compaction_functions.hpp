@@ -50,12 +50,22 @@ public:
 	vector<Value> partition_values;
 	optional_idx row_id_start;
 	CompactionType type;
+	shared_ptr<DuckLakeCompactionSchedule> schedule;
+	idx_t group_index = 0;
+	idx_t memory_estimate = 0;
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
 		auto &child = planner.CreatePlan(*children[0]);
-		return planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
-		                                        partition_id, std::move(partition_values), row_id_start, child, type);
+		auto &result =
+		    planner
+		        .Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
+		                                  partition_id, std::move(partition_values), row_id_start, child, type)
+		        .Cast<DuckLakeCompaction>();
+		result.schedule = schedule;
+		result.group_index = group_index;
+		result.memory_estimate = memory_estimate;
+		return result;
 	}
 
 	string GetName() const override {
@@ -85,9 +95,11 @@ public:
 class DuckLakeCompactor {
 public:
 	DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
-	                  Binder &binder, TableIndex table_id, uint64_t max_files, DuckLakeMergeAdjacentOptions options);
+	                  Binder &binder, TableIndex table_id, uint64_t max_files, DuckLakeMergeAdjacentOptions options,
+	                  shared_ptr<DuckLakeCompactionSchedule> schedule);
 	DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
-	                  Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold);
+	                  Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold,
+	                  shared_ptr<DuckLakeCompactionSchedule> schedule);
 	void GenerateCompactions(DuckLakeTableEntry &table, vector<unique_ptr<LogicalOperator>> &compactions);
 	unique_ptr<LogicalOperator> GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry> source_files,
 	                                                      bool bind_to_latest_schema = false);
@@ -113,6 +125,7 @@ private:
 	uint64_t max_files;
 	double delete_threshold = 0.95;
 	DuckLakeMergeAdjacentOptions options;
+	shared_ptr<DuckLakeCompactionSchedule> schedule;
 
 	CompactionType type;
 };

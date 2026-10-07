@@ -1,0 +1,115 @@
+# name: test/sql/compaction/merge_adjacent_memory_limit.test_slow
+# description: merge_adjacent_files compacts many groups of wide files of several tables under a memory limit too small to compact all groups at once
+# group: [compaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+SET threads = 14
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/merge_adjacent_memory_limit', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE MACRO batch(b) AS TABLE
+SELECT hash(i) % 1000000 AS k,
+       md5((i * 1)::VARCHAR) || md5((i * 1 + 1)::VARCHAR) || md5((i * 1 + 2)::VARCHAR) || md5((i * 1 + 3)::VARCHAR) AS s1,
+       md5((i * 2)::VARCHAR) || md5((i * 2 + 1)::VARCHAR) || md5((i * 2 + 2)::VARCHAR) || md5((i * 2 + 3)::VARCHAR) AS s2,
+       md5((i * 3)::VARCHAR) || md5((i * 3 + 1)::VARCHAR) || md5((i * 3 + 2)::VARCHAR) || md5((i * 3 + 3)::VARCHAR) AS s3,
+       md5((i * 4)::VARCHAR) || md5((i * 4 + 1)::VARCHAR) || md5((i * 4 + 2)::VARCHAR) || md5((i * 4 + 3)::VARCHAR) AS s4,
+       md5((i * 5)::VARCHAR) || md5((i * 5 + 1)::VARCHAR) || md5((i * 5 + 2)::VARCHAR) || md5((i * 5 + 3)::VARCHAR) AS s5,
+       md5((i * 6)::VARCHAR) || md5((i * 6 + 1)::VARCHAR) || md5((i * 6 + 2)::VARCHAR) || md5((i * 6 + 3)::VARCHAR) AS s6,
+       md5((i * 7)::VARCHAR) || md5((i * 7 + 1)::VARCHAR) || md5((i * 7 + 2)::VARCHAR) || md5((i * 7 + 3)::VARCHAR) AS s7,
+       md5((i * 8)::VARCHAR) || md5((i * 8 + 1)::VARCHAR) || md5((i * 8 + 2)::VARCHAR) || md5((i * 8 + 3)::VARCHAR) AS s8
+FROM range(b * 1000000, b * 1000000 + 30000) r(i)
+
+statement ok
+CREATE TABLE ducklake.sorted AS FROM batch(0) LIMIT 0
+
+statement ok
+ALTER TABLE ducklake.sorted SET SORTED BY (k)
+
+statement ok
+CREATE TABLE ducklake.unsorted AS FROM batch(0) LIMIT 0
+
+loop b 0 16
+
+statement ok
+INSERT INTO ducklake.sorted FROM batch({b})
+
+statement ok
+INSERT INTO ducklake.unsorted FROM batch({b})
+
+endloop
+
+query II nosort sorted_before
+SELECT count(*), sum(hash(k, s1, s2, s3, s4, s5, s6, s7, s8)) FROM ducklake.sorted
+----
+
+query II nosort unsorted_before
+SELECT count(*), sum(hash(k, s1, s2, s3, s4, s5, s6, s7, s8)) FROM ducklake.unsorted
+----
+
+# groups of four sorted and five unsorted files, all seven groups together need several times the memory limit
+statement ok
+CALL ducklake.set_option('target_file_size', '128MB')
+
+statement ok
+SET memory_limit = '800MB'
+
+statement ok
+PREPARE compact AS SELECT table_name, files_processed, files_created FROM ducklake_merge_adjacent_files('ducklake') ORDER BY ALL
+
+# a rolled back execution leaves the files in place, executing the prepared plan again compacts them
+statement ok
+BEGIN
+
+query III
+EXECUTE compact
+----
+sorted	4	1
+sorted	4	1
+sorted	4	1
+sorted	4	1
+unsorted	5	1
+unsorted	5	1
+unsorted	5	1
+
+statement ok
+ROLLBACK
+
+query III
+EXECUTE compact
+----
+sorted	4	1
+sorted	4	1
+sorted	4	1
+sorted	4	1
+unsorted	5	1
+unsorted	5	1
+unsorted	5	1
+
+statement ok
+RESET memory_limit
+
+query II nosort sorted_before
+SELECT count(*), sum(hash(k, s1, s2, s3, s4, s5, s6, s7, s8)) FROM ducklake.sorted
+----
+
+query II nosort unsorted_before
+SELECT count(*), sum(hash(k, s1, s2, s3, s4, s5, s6, s7, s8)) FROM ducklake.unsorted
+----
+
+query I
+SELECT count(*) FROM (
+	SELECT k, lag(k) OVER (PARTITION BY filename ORDER BY file_row_number) AS previous
+	FROM ducklake.sorted)
+WHERE previous > k
+----
+0

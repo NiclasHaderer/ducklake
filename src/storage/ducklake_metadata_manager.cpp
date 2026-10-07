@@ -2542,6 +2542,19 @@ DuckLakeMetadataManager::GetExtendedFilesForTable(DuckLakeTableEntry &table, Duc
 	return files;
 }
 
+static void GetListLeafColumns(const DuckLakeFieldId &field_id, bool in_list, vector<string> &result) {
+	in_list = in_list || field_id.Type().InternalType() == PhysicalType::LIST;
+	if (!field_id.HasChildren()) {
+		if (in_list) {
+			result.push_back(to_string(field_id.GetFieldIndex().index));
+		}
+		return;
+	}
+	for (auto &child : field_id.Children()) {
+		GetListLeafColumns(*child, in_list, result);
+	}
+}
+
 vector<DuckLakeCompactionFileEntry> DuckLakeMetadataManager::GetFilesForCompaction(DuckLakeTableEntry &table,
                                                                                    CompactionType type,
                                                                                    double deletion_threshold,
@@ -2551,6 +2564,23 @@ vector<DuckLakeCompactionFileEntry> DuckLakeMetadataManager::GetFilesForCompacti
 	// Determine the effective max file size threshold for filtering
 	idx_t effective_max_file_size =
 	    options.max_file_size.IsValid() ? options.max_file_size.GetIndex() : options.target_file_size;
+	vector<string> list_leaf_columns;
+	for (auto &field_id : table.GetFieldData().GetFieldIds()) {
+		GetListLeafColumns(*field_id, false, list_leaf_columns);
+	}
+	string list_stats_select = "NULL, NULL";
+	string list_stats_join;
+	if (!list_leaf_columns.empty()) {
+		list_stats_select = "list_stats.column_ids, list_stats.value_counts";
+		list_stats_join = StringUtil::Format(R"(
+LEFT JOIN (
+	SELECT data_file_id, ARRAY_AGG(column_id) column_ids, ARRAY_AGG(value_count) value_counts
+	FROM {METADATA_CATALOG}.ducklake_file_column_stats
+	WHERE table_id=%d AND column_id IN (%s) AND value_count IS NOT NULL
+	GROUP BY data_file_id
+) list_stats USING (data_file_id))",
+		                                     table_id.index, StringUtil::Join(list_leaf_columns, ", "));
+	}
 	string data_select_list =
 	    "data.data_file_id, data.record_count, data.row_id_start, data.begin_snapshot, "
 	    "data.end_snapshot, data.mapping_id, sr.schema_version , data.partial_max, "
@@ -2559,7 +2589,7 @@ vector<DuckLakeCompactionFileEntry> DuckLakeMetadataManager::GetFilesForCompacti
 	    "(partition_spec.end_snapshot IS NULL OR partition_spec.begin_snapshot < partition_spec.end_snapshot) "
 	    "THEN COALESCE(partition_spec.end_snapshot - 1, data.begin_snapshot) END AS partition_snapshot_id, "
 	    "partition_sr.schema_version AS partition_schema_version, partition_info.keys, " +
-	    GetFileSelectList("data");
+	    list_stats_select + ", " + GetFileSelectList("data");
 	string delete_select_list = "del.data_file_id AS del_data_file_id,"
 	                            "del.delete_file_id AS del_delete_file_id, "
 	                            "del.delete_count, "
@@ -2661,12 +2691,13 @@ LEFT JOIN (
 	SELECT data_file_id, ARRAY_AGG(partition_value ORDER BY partition_key_index) keys
 	FROM {METADATA_CATALOG}.ducklake_file_partition_value%s
 	GROUP BY data_file_id
-) partition_info USING (data_file_id)
+) partition_info USING (data_file_id)%s
 WHERE data.table_id=%d %s
 ORDER BY data.begin_snapshot, data.row_id_start, data.data_file_id, del.begin_snapshot
 	)",
 	                                candidate_files_cte, table_id.index, select_list, data_file_source, table_id.index,
-	                                delete_file_filter, partition_value_filter, table_id.index, file_filter_clause);
+	                                delete_file_filter, partition_value_filter, list_stats_join, table_id.index,
+	                                file_filter_clause);
 	auto result = Query(query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get compaction file list from DuckLake: ");
@@ -2707,6 +2738,15 @@ ORDER BY data.begin_snapshot, data.row_id_start, data.data_file_id, del.begin_sn
 			}
 		}
 		col_idx++;
+		if (!row.IsNull(col_idx)) {
+			auto &column_ids = ListValue::GetChildren(row.GetValue<Value>(col_idx));
+			auto &value_counts = ListValue::GetChildren(row.GetValue<Value>(col_idx + 1));
+			for (idx_t i = 0; i < column_ids.size(); i++) {
+				auto column_id = FieldIndex(column_ids[i].GetValue<idx_t>());
+				new_entry.file.list_value_counts[column_id] = value_counts[i].GetValue<idx_t>();
+			}
+		}
+		col_idx += 2;
 		new_entry.file.data = ReadDataFile(table, row, col_idx, IsEncrypted());
 		if (files.empty() || files.back().file.id != new_entry.file.id) {
 			// new file - push it into the file list
