@@ -85,6 +85,12 @@
       ]
     },
     {
+      "reason": "String stats exactness was added in 1.1-dev1, without it the compaction memory estimate falls back to the file size",
+      "paths": [
+        "test/sql/compaction/merge_adjacent_schedule.test"
+      ]
+    },
+    {
       "reason": "Epoch partition transforms were added in 1.1-dev1 and are not available when ducklake_default_version is pinned to 1.0",
       "paths": [
         "test/sql/add_files/add_file_epoch_partitioned.test",

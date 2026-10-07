@@ -23,12 +23,13 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/planner/expression_binder/order_binder.hpp"
 #include "duckdb/planner/expression_binder/select_bind_state.hpp"
-#include "duckdb/parser/expression/columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/common/deque.hpp"
+#include "duckdb/common/reference_map.hpp"
+#include "duckdb/parallel/meta_pipeline.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/parallel/pipeline.hpp"
 
 namespace duckdb {
 
@@ -68,11 +69,62 @@ DuckLakeCompaction::DuckLakeCompaction(PhysicalPlan &physical_plan, const vector
                                        DuckLakeTableEntry &table, vector<DuckLakeCompactionFileEntry> source_files_p,
                                        string encryption_key_p, optional_idx partition_id,
                                        vector<Value> partition_values_p, optional_idx row_id_start,
-                                       PhysicalOperator &child, CompactionType type)
+                                       PhysicalOperator &child, CompactionType type, idx_t memory_estimate)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 0), table(table),
       source_files(std::move(source_files_p)), encryption_key(std::move(encryption_key_p)), partition_id(partition_id),
-      partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type) {
+      partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type),
+      memory_estimate(memory_estimate) {
 	children.push_back(child);
+}
+
+//===--------------------------------------------------------------------===//
+// Compaction Union
+//===--------------------------------------------------------------------===//
+void DuckLakeCompactionUnion::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+	PhysicalUnion::BuildPipelines(current, meta_pipeline);
+	reference_map_t<const PhysicalOperator, reference<MetaPipeline>> groups;
+	for (auto &child : meta_pipeline.GetChildren()) {
+		groups.emplace(*child->GetSink(), *child);
+	}
+	auto &context = meta_pipeline.GetExecutor().context;
+	const auto memory_limit = BufferManager::GetBufferManager(context).GetMaxMemory();
+	vector<shared_ptr<Pipeline>> last_pipelines;
+	// the index and memory estimate of the groups that may run when the next group starts
+	deque<pair<idx_t, idx_t>> running;
+	idx_t running_memory = 0;
+	// Every group waits for the last group removed from running. The last pipelines of the groups complete in order,
+	// so this also waits for all groups before it.
+	optional_idx finished_group;
+	for (auto &child : children) {
+		auto &compaction = child.get().Cast<DuckLakeCompaction>();
+		const auto entry = groups.find(compaction);
+		D_ASSERT(entry != groups.end());
+		auto &group = entry->second.get();
+		while (!running.empty() && running_memory + compaction.memory_estimate > memory_limit) {
+			finished_group = running.front().first;
+			running_memory -= running.front().second;
+			running.pop_front();
+		}
+		DUCKDB_LOG_DEBUG(
+		    context, StringUtil::Format(
+		                 "DuckLake compaction group %d (%s): memory estimate %d, waits for %s", last_pipelines.size(),
+		                 compaction.table.name.GetIdentifierName(), compaction.memory_estimate,
+		                 finished_group.IsValid() ? to_string(finished_group.GetIndex()) : string("none")));
+		if (finished_group.IsValid()) {
+			vector<shared_ptr<Pipeline>> pipelines;
+			group.GetPipelines(pipelines, true);
+			for (auto &pipeline : pipelines) {
+				pipeline->AddDependency(last_pipelines[finished_group.GetIndex()]);
+			}
+		}
+		auto &last_pipeline = group.GetBasePipeline();
+		if (!last_pipelines.empty()) {
+			last_pipeline->AddDependency(last_pipelines.back());
+		}
+		running.emplace_back(last_pipelines.size(), compaction.memory_estimate);
+		running_memory += compaction.memory_estimate;
+		last_pipelines.push_back(last_pipeline);
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -475,6 +527,48 @@ unique_ptr<LogicalOperator> DuckLakeCompactor::PlanRewriteScan(
 	return root;
 }
 
+//! Compaction copies/sorts the data, so we use more memory than the purely decoded version
+static constexpr idx_t PEAK_PER_MEMORY_BYTE = 4;
+//! Different papers seem to suggest an avg compression factor 7, I slightly overshot with 10 because I assume lakes
+// are used to store very repetitive data
+static constexpr idx_t MEMORY_PER_FILE_BYTE_OF_UNKNOWN_SIZE = 10;
+
+static idx_t EstimateColumnSize(const DuckLakeFieldId &field_id, idx_t value_count,
+                                const DuckLakeCompactionFileData &file, optional_ptr<DuckLakeTableStats> table_stats,
+                                const bool in_list, bool &size_unknown) {
+	auto list_value_count = file.list_value_counts.find(field_id.GetFieldIndex());
+	if (list_value_count != file.list_value_counts.end()) {
+		value_count = list_value_count->second;
+	}
+	auto &type = field_id.Type();
+	auto physical_type = type.InternalType();
+	if (type.id() == LogicalTypeId::VARIANT || (in_list && physical_type == PhysicalType::LIST)) {
+		size_unknown = true;
+	}
+	idx_t width = GetTypeIdSize(physical_type);
+	if (physical_type == PhysicalType::VARCHAR) {
+		optional_ptr<const DuckLakeColumnStats> column_stats;
+		if (table_stats) {
+			if (const auto entry = table_stats->column_stats.find(field_id.GetFieldIndex());
+			    entry != table_stats->column_stats.end()) {
+				column_stats = entry->second;
+			}
+		}
+		if (!column_stats || !column_stats->EffectiveMinIsExact() || !column_stats->EffectiveMaxIsExact()) {
+			size_unknown = true;
+		}
+		if (column_stats) {
+			width += (column_stats->min.size() + column_stats->max.size()) / 2;
+		}
+	}
+	idx_t size = value_count * width;
+	for (auto &child : field_id.Children()) {
+		size += EstimateColumnSize(*child, value_count, file, table_stats,
+		                           in_list || physical_type == PhysicalType::LIST, size_unknown);
+	}
+	return size;
+}
+
 unique_ptr<LogicalOperator>
 DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry> source_files,
                                              bool bind_to_latest_schema) {
@@ -589,6 +683,22 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	DuckLakeCopyInput copy_input(context, table, data_path);
 	// merge_adjacent_files does not use partitioning information - instead we always merge within partitions
 	copy_input.partition_data = nullptr;
+	auto table_stats = table.GetTableStats(transaction);
+	idx_t virtual_column_count = (write_row_id ? 1 : 0) + (write_snapshot_id ? 1 : 0);
+	idx_t memory_size = 0;
+	idx_t file_size = 0;
+	bool size_unknown = false;
+	for (auto &source : actionable_source_files) {
+		// Simple heuristic for virtual columns
+		memory_size += source.file.row_count * virtual_column_count * sizeof(int64_t);
+		// Add real in parquet columns
+		for (auto &field_id : table.GetFieldData().GetFieldIds()) {
+			memory_size += EstimateColumnSize(*field_id, source.file.row_count, source.file, table_stats.get(), false,
+			                                  size_unknown);
+		}
+		file_size += source.file.data.file_size_bytes;
+	}
+
 	unique_ptr<LogicalCopyToFile> copy;
 	auto root = PlanRewriteScan(
 	    context, binder, table, copy_input, write_row_id, write_snapshot_id,
@@ -622,10 +732,17 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 		target_row_id_start = source_files[0].file.row_id_start;
 	}
 
+	auto memory_estimate =
+	    PEAK_PER_MEMORY_BYTE * MaxValue(
+	                               // Estimated
+	                               memory_size,
+	                               // Lower bound
+	                               file_size * (size_unknown ? MEMORY_PER_FILE_BYTE_OF_UNKNOWN_SIZE : 1));
+
 	// followed by the compaction operator (that writes the results back to the
 	auto compaction = make_uniq<DuckLakeLogicalCompaction>(
 	    binder.GenerateTableIndex(), table, std::move(actionable_source_files), std::move(copy_input.encryption_key),
-	    partition_id, std::move(partition_values), target_row_id_start, type);
+	    partition_id, std::move(partition_values), target_row_id_start, type, memory_estimate);
 	compaction->children.push_back(std::move(copy));
 	return std::move(compaction);
 }
@@ -633,7 +750,7 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 //===--------------------------------------------------------------------===//
 // Function
 //===--------------------------------------------------------------------===//
-static unique_ptr<LogicalOperator> GenerateCompactionOperator(TableFunctionBindInput &input, TableIndex bind_index,
+static unique_ptr<LogicalOperator> GenerateCompactionOperator(TableIndex bind_index,
                                                               vector<unique_ptr<LogicalOperator>> &compactions) {
 	if (compactions.empty()) {
 		// nothing to compact - generate an empty result
@@ -645,8 +762,7 @@ static unique_ptr<LogicalOperator> GenerateCompactionOperator(TableFunctionBindI
 		compactions[0]->Cast<DuckLakeLogicalCompaction>().table_index = bind_index;
 		return std::move(compactions[0]);
 	}
-	return input.binder->UnionOperators(std::move(compactions), DuckLakeLogicalCompaction::GetResultTypes().size(),
-	                                    bind_index);
+	return make_uniq<DuckLakeLogicalCompactionUnion>(bind_index, std::move(compactions));
 }
 
 static void GenerateCompaction(ClientContext &context, DuckLakeTransaction &transaction,
@@ -749,6 +865,9 @@ static unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableF
 	} else {
 		tables = DuckLakeBaseMetadataFunction::GetTablesInScope(context, ducklake_catalog, schema, string());
 	}
+	// the catalog yields tables in hash order, which differs between platforms, and the groups are scheduled in order
+	std::sort(tables.begin(), tables.end(),
+	          [](DuckLakeTableEntry &a, DuckLakeTableEntry &b) { return a.GetTableId() < b.GetTableId(); });
 	vector<unique_ptr<LogicalOperator>> compactions;
 	for (auto &table_ref : tables) {
 		auto &cur_table = table_ref.get();
@@ -759,7 +878,7 @@ static unique_ptr<LogicalOperator> BindCompaction(ClientContext &context, TableF
 		GenerateCompaction(context, transaction, ducklake_catalog, input, cur_table, type, delete_threshold, max_files,
 		                   min_file_size, max_file_size, newer_than, compactions);
 	}
-	return GenerateCompactionOperator(input, bind_index, compactions);
+	return GenerateCompactionOperator(bind_index, compactions);
 }
 
 static unique_ptr<LogicalOperator> MergeAdjacentFilesBind(ClientContext &context, TableFunctionBindInput &input,

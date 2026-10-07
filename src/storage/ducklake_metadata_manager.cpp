@@ -2383,7 +2383,8 @@ vector<DuckLakeCompactionFileEntry> DuckLakeMetadataManager::GetFilesForCompacti
 	string data_select_list =
 	    "data.data_file_id, data.record_count, data.row_id_start, data.begin_snapshot, "
 	    "data.end_snapshot, data.mapping_id, sr.schema_version , data.partial_max, "
-	    "data.partition_id, partition_sr.schema_version AS partition_schema_version, partition_info.keys, " +
+	    "data.partition_id, partition_sr.schema_version AS partition_schema_version, partition_info.keys, "
+	    "list_stats.value_counts, " +
 	    GetFileSelectList("data");
 	string delete_select_list = "del.data_file_id AS del_data_file_id,"
 	                            "del.delete_file_id AS del_delete_file_id, "
@@ -2487,11 +2488,22 @@ LEFT JOIN (
 	FROM {METADATA_CATALOG}.ducklake_file_partition_value%s
 	GROUP BY data_file_id
 ) partition_info USING (data_file_id)
+LEFT JOIN (
+	SELECT stats.data_file_id,
+		ARRAY_AGG({'column_id': stats.column_id, 'value_count': stats.value_count + COALESCE(stats.null_count, 0)})
+		    value_counts
+	FROM {METADATA_CATALOG}.ducklake_file_column_stats stats
+	JOIN {METADATA_CATALOG}.ducklake_data_file list_file USING (data_file_id)
+	WHERE stats.table_id=%d AND list_file.end_snapshot IS NULL
+		AND stats.value_count + COALESCE(stats.null_count, 0) <> list_file.record_count
+	GROUP BY stats.data_file_id
+) list_stats USING (data_file_id)
 WHERE data.table_id=%d %s
 ORDER BY data.begin_snapshot, data.row_id_start, data.data_file_id, del.begin_snapshot
 	)",
 	                                candidate_files_cte, table_id.index, select_list, data_file_source, table_id.index,
-	                                delete_file_filter, partition_value_filter, table_id.index, file_filter_clause);
+	                                delete_file_filter, partition_value_filter, table_id.index, table_id.index,
+	                                file_filter_clause);
 	auto result = Query(query);
 	result->ThrowIfError("Failed to get compaction file list from DuckLake: ");
 	vector<DuckLakeCompactionFileEntry> files;
@@ -2516,6 +2528,14 @@ ORDER BY data.begin_snapshot, data.row_id_start, data.data_file_id, del.begin_sn
 			auto list_val = row.GetValue<Value>(col_idx);
 			for (auto &entry : ListValue::GetChildren(list_val)) {
 				new_entry.file.partition_values.push_back(entry);
+			}
+		}
+		col_idx++;
+		if (!row.IsNull(col_idx)) {
+			auto value_counts = row.GetValue<Value>(col_idx);
+			for (auto &entry : ListValue::GetChildren(value_counts)) {
+				auto &fields = StructValue::GetChildren(entry);
+				new_entry.file.list_value_counts[FieldIndex(fields[0].GetValue<idx_t>())] = fields[1].GetValue<idx_t>();
 			}
 		}
 		col_idx++;
