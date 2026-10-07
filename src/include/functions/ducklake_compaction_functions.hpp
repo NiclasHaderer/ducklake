@@ -36,10 +36,11 @@ public:
 	DuckLakeLogicalCompaction(TableIndex table_index, DuckLakeTableEntry &table,
 	                          vector<DuckLakeCompactionFileEntry> source_files_p, string encryption_key_p,
 	                          optional_idx partition_id, vector<Value> partition_values_p, optional_idx row_id_start,
-	                          CompactionType type)
+	                          CompactionType type, idx_t memory_estimate)
 	    : table_index(table_index), table(table), source_files(std::move(source_files_p)),
 	      encryption_key(std::move(encryption_key_p)), partition_id(partition_id),
-	      partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type) {
+	      partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type),
+	      memory_estimate(memory_estimate) {
 	}
 
 	TableIndex table_index;
@@ -50,12 +51,14 @@ public:
 	vector<Value> partition_values;
 	optional_idx row_id_start;
 	CompactionType type;
+	const idx_t memory_estimate;
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
 		auto &child = planner.CreatePlan(*children[0]);
 		return planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
-		                                        partition_id, std::move(partition_values), row_id_start, child, type);
+		                                        partition_id, std::move(partition_values), row_id_start, child, type,
+		                                        memory_estimate);
 	}
 
 	string GetName() const override {
@@ -65,17 +68,51 @@ public:
 	string GetExtensionName() const override {
 		return "ducklake";
 	}
+
 	vector<ColumnBinding> GetColumnBindings() override {
-		vector<ColumnBinding> result;
-		result.emplace_back(table_index, ProjectionIndex(0));
-		result.emplace_back(table_index, ProjectionIndex(1));
-		result.emplace_back(table_index, ProjectionIndex(2));
-		result.emplace_back(table_index, ProjectionIndex(3));
-		return result;
+		return GenerateColumnBindings(table_index, ResultTypes().size());
 	}
 
 	void ResolveTypes() override {
-		types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
+		types = ResultTypes();
+	}
+
+	static vector<LogicalType> ResultTypes() {
+		return {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
+	}
+};
+
+class DuckLakeLogicalCompactionUnion : public LogicalExtensionOperator {
+public:
+	DuckLakeLogicalCompactionUnion(TableIndex table_index, vector<unique_ptr<LogicalOperator>> compactions)
+	    : table_index(table_index) {
+		children = std::move(compactions);
+	}
+
+	TableIndex table_index;
+
+public:
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
+		ArenaLinkedList<reference<PhysicalOperator>> compactions(planner.ArenaRef());
+		for (auto &child : children) {
+			compactions.push_back(planner.CreatePlan(*child));
+		}
+		return planner.Make<DuckLakeCompactionUnion>(types, compactions, estimated_cardinality, false);
+	}
+
+	string GetName() const override {
+		return "DUCKLAKE_COMPACTION_UNION";
+	}
+
+	string GetExtensionName() const override {
+		return "ducklake";
+	}
+	vector<ColumnBinding> GetColumnBindings() override {
+		return GenerateColumnBindings(table_index, DuckLakeLogicalCompaction::ResultTypes().size());
+	}
+
+	void ResolveTypes() override {
+		types = DuckLakeLogicalCompaction::ResultTypes();
 	}
 };
 
