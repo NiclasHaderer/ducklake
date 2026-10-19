@@ -2,6 +2,7 @@
 
 #include "common/ducklake_row_helpers.hpp"
 #include "common/ducklake_types.hpp"
+#include "common/ducklake_util.hpp"
 #include "common/ducklake_version.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -631,7 +632,7 @@ DuckLakeCommitContext DuckLakeServerSideCommit::BuildContext(idx_t &committed_sn
 	ctx.skip_drop_empty_inlined = true;
 	ctx.supports_v1_1_metadata = supports_v1_1_metadata;
 	ctx.conflict_query_executor = [this](string q) -> unique_ptr<QueryResult> {
-		auto sql = SubstitutePlaceholders(std::move(q), transaction_snapshot);
+		auto sql = SubstitutePlaceholders(q, transaction_snapshot);
 		return fresh_conn.Query(sql);
 	};
 	ctx.get_snapshot = [this]() {
@@ -655,11 +656,11 @@ DuckLakeCommitContext DuckLakeServerSideCommit::BuildContext(idx_t &committed_sn
 	ctx.query_metadata = [this](string q) -> unique_ptr<QueryResult> {
 		// Snapshot-scoped placeholders are absent on this path; empty snapshot is a no-op.
 		DuckLakeSnapshot empty {};
-		auto sql = SubstitutePlaceholders(std::move(q), empty);
+		auto sql = SubstitutePlaceholders(q, empty);
 		return fresh_conn.Query(sql);
 	};
 	ctx.query_metadata_with_snapshot = [this](DuckLakeSnapshot snapshot, string q) -> unique_ptr<QueryResult> {
-		auto sql = SubstitutePlaceholders(std::move(q), snapshot);
+		auto sql = SubstitutePlaceholders(q, snapshot);
 		return fresh_conn.Query(sql);
 	};
 	ctx.write_inlined_data = [this](DuckLakeSnapshot &, const vector<DuckLakeInlinedDataInfo> &new_data,
@@ -725,12 +726,12 @@ bool DuckLakeServerSideCommit::InlinedFileDeletionTableExists(TableIndex table_i
 	return fresh_conn.TableInfo(database_name, Identifier(metadata_schema_name), Identifier(table_name)) != nullptr;
 }
 
-string DuckLakeServerSideCommit::SubstitutePlaceholders(string sql, const DuckLakeSnapshot &snapshot) const {
-	sql = StringUtil::Replace(sql, "{METADATA_CATALOG}", schema_id);
-	sql = StringUtil::Replace(sql, "{METADATA_CATALOG_NAME_LITERAL}", "(SELECT current_database())");
-	sql = StringUtil::Replace(sql, "{METADATA_SCHEMA_NAME_LITERAL}", SQLString::ToString(metadata_schema_name));
-	DuckLakeMetadataManager::SubstituteSnapshotPlaceholders(snapshot, sql);
-	return sql;
+string DuckLakeServerSideCommit::SubstitutePlaceholders(const string &sql, const DuckLakeSnapshot &snapshot) const {
+	auto replacements = DuckLakeMetadataManager::SnapshotPlaceholders(snapshot);
+	replacements.emplace_back("{METADATA_CATALOG}", schema_id);
+	replacements.emplace_back("{METADATA_CATALOG_NAME_LITERAL}", "(SELECT current_database())");
+	replacements.emplace_back("{METADATA_SCHEMA_NAME_LITERAL}", SQLString::ToString(metadata_schema_name));
+	return DuckLakeUtil::ReplaceSkippingQuotes(sql, replacements);
 }
 
 unique_ptr<QueryResult> DuckLakeServerSideCommit::RunQuery(const string &query, const char *what) {
