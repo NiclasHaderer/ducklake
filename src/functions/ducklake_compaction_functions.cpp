@@ -45,7 +45,7 @@ namespace duckdb {
 vector<OrderByNode> DuckLakeCompactor::ParseSortOrders(const DuckLakeSort &sort_data) {
 	vector<OrderByNode> pre_bound_orders;
 	for (auto &field : sort_data.fields) {
-		if (field.dialect != "duckdb") {
+		if (!field.IsDuckDBDialect()) {
 			continue;
 		}
 		auto parsed_expression = Parser::GetBuiltinParser().ParseExpressionList(field.expression);
@@ -85,11 +85,10 @@ PhysicalOperator &DuckLakeLogicalCompaction::CreatePlan(ClientContext &context, 
 		}
 		transaction.ReleaseMetadataTransaction();
 	}
-	if (ordered_input) {
-		DuckLakeInsert::PreserveSortedOrder(child.Cast<PhysicalCopyToFile>());
-	}
+	auto sort_id = DuckLakeInsert::PlanSortedCopy(child, sort);
 	return planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
-	                                        partition_id, std::move(partition_values), row_id_start, child, type);
+	                                        partition_id, sort_id, std::move(partition_values), row_id_start, child,
+	                                        type);
 }
 
 //===--------------------------------------------------------------------===//
@@ -97,12 +96,12 @@ PhysicalOperator &DuckLakeLogicalCompaction::CreatePlan(ClientContext &context, 
 //===--------------------------------------------------------------------===//
 DuckLakeCompaction::DuckLakeCompaction(PhysicalPlan &physical_plan, const vector<LogicalType> &types,
                                        DuckLakeTableEntry &table, vector<DuckLakeCompactionFileEntry> source_files_p,
-                                       string encryption_key_p, optional_idx partition_id,
+                                       string encryption_key_p, optional_idx partition_id, optional_idx sort_id,
                                        vector<Value> partition_values_p, optional_idx row_id_start,
                                        PhysicalOperator &child, CompactionType type)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 0), table(table),
       source_files(std::move(source_files_p)), encryption_key(std::move(encryption_key_p)), partition_id(partition_id),
-      partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type) {
+      sort_id(sort_id), partition_values(std::move(partition_values_p)), row_id_start(row_id_start), type(type) {
 	children.push_back(child);
 }
 
@@ -137,7 +136,7 @@ unique_ptr<GlobalSinkState> DuckLakeCompaction::GetGlobalSinkState(ClientContext
 
 SinkResultType DuckLakeCompaction::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	DuckLakeInsert::AddWrittenFiles(global_state, chunk, encryption_key, partition_id);
+	DuckLakeInsert::AddWrittenFiles(global_state, chunk, encryption_key, partition_id, sort_id);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -788,7 +787,9 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	auto compaction = make_uniq<DuckLakeLogicalCompaction>(
 	    binder.GenerateTableIndex(), table, std::move(actionable_source_files), std::move(copy_input.encryption_key),
 	    partition_id, std::move(partition_values), target_row_id_start, type);
-	compaction->ordered_input = sort_applied && !merge_in_order;
+	if (sort_applied) {
+		compaction->sort = sort_data;
+	}
 	compaction->children.push_back(std::move(copy));
 	return std::move(compaction);
 }

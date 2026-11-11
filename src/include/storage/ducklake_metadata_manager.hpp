@@ -441,10 +441,12 @@ public:
 	//! via GetCatalogForSnapshot) since the diff is computed against it.
 	static string WriteNewPartitionKeys(const vector<DuckLakePartitionInfo> &existing_partitions,
 	                                    const vector<DuckLakePartitionInfo> &new_partitions);
-	//! Maps the id of a last new spec that equals the committed spec, which is not written, to the committed id
-	static unordered_map<idx_t, idx_t>
-	GetUnchangedPartitionIds(const vector<DuckLakePartitionInfo> &existing_partitions,
-	                         const vector<DuckLakePartitionInfo> &new_partitions);
+	//! Maps the id of a last new partition or sort spec that equals the committed spec, which is not written, to the
+	//! committed id
+	static unordered_map<idx_t, idx_t> GetUnchangedSpecIds(const vector<DuckLakePartitionInfo> &existing_partitions,
+	                                                       const vector<DuckLakePartitionInfo> &new_partitions,
+	                                                       const vector<DuckLakeSortInfo> &existing_sorts,
+	                                                       const vector<DuckLakeSortInfo> &new_sorts);
 	//! Emits the sort-key diff SQL. Caller supplies the existing sort state (fetched via
 	//! GetCatalogForSnapshot) since the diff is computed against it.
 	static string WriteNewSortKeys(const vector<DuckLakeSortInfo> &existing_sorts,
@@ -470,7 +472,8 @@ public:
 	//! {METADATA_CATALOG} / {SNAPSHOT_ID} placeholders. Caller supplies resolved paths (one per file,
 	//! same order) since path policy differs across callers (schema-relative vs. always-absolute).
 	static string WriteNewDataFilesSqlBatch(const vector<DuckLakeFileInfo> &new_files,
-	                                        const vector<DuckLakePath> &resolved_paths, bool supports_v1_1_metadata);
+	                                        const vector<DuckLakePath> &resolved_paths, bool supports_v1_1_metadata,
+	                                        bool supports_v2_0_metadata);
 	//! Opt-in fast-path: if this backend supports the DuckDB Appender API, write the files directly
 	bool TryAppendDataFiles(DuckLakeSnapshot &commit_snapshot, const vector<DuckLakeFileInfo> &new_files,
 	                        const vector<DuckLakeTableInfo> &new_tables,

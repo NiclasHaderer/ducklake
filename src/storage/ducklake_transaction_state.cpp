@@ -693,10 +693,11 @@ DuckLakeFileInfo DuckLakeTransactionState::GetNewDataFile(const DuckLakeDataFile
                                                           optional_idx row_id_start) {
 	auto data_file = DuckLakeTransaction::BuildDataFileInfo(file, commit_state.commit_snapshot, table_id, row_id_start);
 	commit_state.PrepareFloatBounds(table_id, data_file.column_stats);
-	commit_state.RemapPartitionId(data_file.partition_id);
-	if (data_file.partition_id.IsValid() &&
-	    data_file.partition_id.GetIndex() >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START) {
-		throw InternalException("Cannot commit data file with transaction-local partition id");
+	for (auto spec_id : {&data_file.partition_id, &data_file.sort_id}) {
+		commit_state.RemapSpecId(*spec_id);
+		if (spec_id->IsValid() && spec_id->GetIndex() >= DuckLakeConstants::TRANSACTION_LOCAL_ID_START) {
+			throw InternalException("Cannot commit data file with a transaction-local partition or sort id");
+		}
 	}
 	commit_state.RemapMappingIndex(data_file.mapping_id);
 	return data_file;
@@ -2329,13 +2330,13 @@ string DuckLakeTransactionState::CommitChanges(DuckLakeCommitState &commit_state
 		}
 		batch_queries +=
 		    DuckLakeMetadataManager::WriteNewPartitionKeys(existing_catalog.partitions, result.new_partition_keys);
-		auto unchanged_partition_ids =
-		    DuckLakeMetadataManager::GetUnchangedPartitionIds(existing_catalog.partitions, result.new_partition_keys);
-		for (auto &partition_id : commit_state.committed_partition_ids) {
+		auto unchanged_spec_ids = DuckLakeMetadataManager::GetUnchangedSpecIds(
+		    existing_catalog.partitions, result.new_partition_keys, existing_catalog.sorts, result.new_sort_keys);
+		for (auto &spec_id : commit_state.committed_spec_ids) {
 			// files of a spec that equals the committed one keep the committed spec
-			auto unchanged = unchanged_partition_ids.find(partition_id.second);
-			if (unchanged != unchanged_partition_ids.end()) {
-				partition_id.second = unchanged->second;
+			auto unchanged = unchanged_spec_ids.find(spec_id.second);
+			if (unchanged != unchanged_spec_ids.end()) {
+				spec_id.second = unchanged->second;
 			}
 		}
 		batch_queries += DuckLakeMetadataManager::WriteNewViews(result.new_views);
@@ -2392,7 +2393,8 @@ string DuckLakeTransactionState::CommitChanges(DuckLakeCommitState &commit_state
 			return string();
 		}
 		return DuckLakeMetadataManager::WriteNewDataFilesSqlBatch(
-		    files, table_relative_paths(files, &DuckLakeFileInfo::file_name), context.supports_v1_1_metadata);
+		    files, table_relative_paths(files, &DuckLakeFileInfo::file_name), context.supports_v1_1_metadata,
+		    context.supports_v2_0_metadata);
 	};
 
 	// write new data / data files

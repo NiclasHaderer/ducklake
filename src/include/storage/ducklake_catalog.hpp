@@ -357,8 +357,11 @@ public:
 	bool SupportsV1_1Metadata() const {
 		return ducklake_version >= DuckLakeVersion::V1_1;
 	}
-	bool SupportsSnapshotTags() const {
+	bool SupportsV2_0Metadata() const {
 		return ducklake_version >= DuckLakeVersion::V2_0_DEV1;
+	}
+	bool SupportsSnapshotTags() const {
+		return SupportsV2_0Metadata();
 	}
 	//! Whether an expiry commits a snapshot whose changes list the expired snapshots
 	bool RecordsExpiredSnapshots() const {

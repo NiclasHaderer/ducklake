@@ -6,6 +6,15 @@
 namespace duckdb {
 
 template <typename Base>
+string DuckLakeMetadataManagerV2_0<Base>::GetDataFileTableStatement() {
+	return "CREATE TABLE {METADATA_CATALOG}.ducklake_data_file(data_file_id BIGINT PRIMARY KEY, table_id BIGINT, "
+	       "begin_snapshot BIGINT, end_snapshot BIGINT, file_order BIGINT, path VARCHAR, path_is_relative BOOLEAN, "
+	       "file_format VARCHAR, record_count BIGINT, file_size_bytes BIGINT, footer_size BIGINT, row_id_start BIGINT, "
+	       "partition_id BIGINT, encryption_key VARCHAR, mapping_id BIGINT, partial_max BIGINT, row_group_count "
+	       "BIGINT, sort_id BIGINT);";
+}
+
+template <typename Base>
 string DuckLakeMetadataManagerV2_0<Base>::GetCreateTableStatements() {
 	auto result = DuckLakeMetadataManagerV1_1<Base>::GetCreateTableStatements();
 	result += DuckLakeMetadataManager::GetSnapshotTagTableStatement() + "\n";

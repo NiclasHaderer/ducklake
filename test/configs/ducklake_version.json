@@ -57,6 +57,13 @@
       ]
     },
     {
+      "reason": "Data files record their sort spec from DuckLake 2.0 on, a catalog pinned to 1.0 has no sort_id column",
+      "paths": [
+        "test/sql/retry/sort_spec_commit_retry.test",
+        "test/sql/sorted_table/data_file_sort_id.test"
+      ]
+    },
+    {
       "reason": "Time travel by timestamp checks the expired_snapshot changes that expiries write from DuckLake 2.0 on, a catalog pinned to 1.0 writes none",
       "paths": [
         "test/sql/time_travel/at_timestamp_expired_snapshots.test",
