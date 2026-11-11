@@ -318,14 +318,19 @@ WHERE col.table_id = getvariable('t_create_then_alter_id') AND info.end_snapshot
 ----
 0	true	identity
 
-# exactly one sort_info row, and its expression is b DESC (the ALTER's), not a
-query I
-SELECT count(*) FROM ducklake_metadata.ducklake_sort_info WHERE table_id = getvariable('t_create_then_alter_id')
-----
-1
-
+# two sort_info rows, the closed CREATE spec (begin = end) and the open ALTER spec
 query III
-SELECT expression, sort_direction, null_order FROM ducklake_metadata.ducklake_sort_expression WHERE table_id = getvariable('t_create_then_alter_id')
+SELECT count(*), count(*) FILTER (WHERE end_snapshot IS NULL), count(*) FILTER (WHERE begin_snapshot = end_snapshot)
+FROM ducklake_metadata.ducklake_sort_info WHERE table_id = getvariable('t_create_then_alter_id')
+----
+2	1	1
+
+# the open sort expression is b DESC (the ALTER's), not a
+query III
+SELECT expr.expression, expr.sort_direction, expr.null_order
+FROM ducklake_metadata.ducklake_sort_expression expr
+JOIN ducklake_metadata.ducklake_sort_info info ON info.sort_id = expr.sort_id AND info.table_id = expr.table_id
+WHERE expr.table_id = getvariable('t_create_then_alter_id') AND info.end_snapshot IS NULL
 ----
 b	DESC	NULLS_LAST
 

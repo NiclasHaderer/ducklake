@@ -74,7 +74,7 @@ public:
 struct DuckLakeInsertPipeline {
 	reference<PhysicalOperator> root;
 	optional_ptr<DuckLakeInlineData> inline_data;
-	bool sorted = false;
+	optional_ptr<DuckLakeSort> sort;
 	//! Whether the sort keys depend on the session, like getvariable()
 	bool sort_requires_rebind = false;
 
@@ -110,6 +110,7 @@ public:
 	map<string, string> ctas_table_options;
 	//! The partition id we are writing into (if any)
 	optional_idx partition_id;
+	optional_idx sort_id;
 	//! The encryption key used for writing the Parquet files
 	string encryption_key;
 	//! Whether the rows to insert depend on the rows of the table, like the NOT MATCHED rows of a MERGE
@@ -139,13 +140,14 @@ public:
 	                                                 idx_t data_inlining_row_limit);
 	static PhysicalOperator &PlanCopyForInsert(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                           DuckLakeCopyInput &copy_input, optional_ptr<PhysicalOperator> plan);
-	//! Makes the copy write sorted input in order, even when it rotates files
-	static void PreserveSortedOrder(PhysicalCopyToFile &physical_copy);
+	//! Makes the copy write its input, sorted by sort, in order even when it rotates files. Returns the sort id the
+	//! written files record, invalid when they do not end up ordered by every field of sort.
+	static optional_idx PlanSortedCopy(PhysicalOperator &copy, optional_ptr<DuckLakeSort> sort);
 	static PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                    DuckLakeTableEntry &table, string encryption_key);
 	static void RemoveEmptyFiles(ClientContext &context, DuckLakeInsertGlobalState &gstate);
 	static void AddWrittenFiles(DuckLakeInsertGlobalState &gstate, DataChunk &chunk, const string &encryption_key,
-	                            optional_idx partition_id, bool set_snapshot_id = false);
+	                            optional_idx partition_id, optional_idx sort_id, bool set_snapshot_id = false);
 
 	static const DuckLakeFieldId &GetTopLevelColumn(DuckLakeCopyInput &copy_input, FieldIndex field_id,
 	                                                optional_idx &index);
@@ -194,8 +196,6 @@ struct DuckLakeCopyInput {
 	TableIndex table_id;
 	InsertVirtualColumns virtual_columns = InsertVirtualColumns::NONE;
 	optional_idx get_table_index;
-	//! Whether the rows reach the copy in the order they must be written in
-	bool ordered_input = false;
 };
 
 } // namespace duckdb

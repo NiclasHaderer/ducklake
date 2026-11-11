@@ -1264,6 +1264,18 @@ void DuckLakeTransaction::AddTableChanges(TableIndex table_id, const LocalTableD
 	}
 }
 
+//! Gives a partition or sort spec the id of this commit attempt and maps the id its data files reference to it.
+//! Files keep referencing the id the spec had before the first attempt, so a retry, which overwrites spec_id
+//! again, must key the map off local_spec_id.
+static idx_t CommitSpecId(DuckLakeCommitState &commit_state, idx_t &spec_id, optional_idx &local_spec_id) {
+	if (!local_spec_id.IsValid()) {
+		local_spec_id = spec_id;
+	}
+	spec_id = commit_state.commit_snapshot.next_catalog_id++;
+	commit_state.committed_spec_ids[local_spec_id.GetIndex()] = spec_id;
+	return spec_id;
+}
+
 DuckLakePartitionInfo DuckLakeTransaction::GetNewPartitionKey(DuckLakeCommitState &commit_state,
                                                               DuckLakeTableEntry &table) {
 	DuckLakePartitionInfo partition_key;
@@ -1279,14 +1291,7 @@ DuckLakePartitionInfo DuckLakeTransaction::GetNewPartitionKey(DuckLakeCommitStat
 		return partition_key;
 		// LCOV_EXCL_STOP
 	}
-	// key the remap off the original transaction-local id: a previous failed commit attempt may have
-	// already overwritten partition_id, while data files still reference the transaction-local id
-	auto local_partition_id = partition_data->local_partition_id.IsValid()
-	                              ? partition_data->local_partition_id.GetIndex()
-	                              : partition_data->partition_id;
-	auto partition_id = commit_state.commit_snapshot.next_catalog_id++;
-	partition_key.id = partition_id;
-	partition_data->partition_id = partition_id;
+	partition_key.id = CommitSpecId(commit_state, partition_data->partition_id, partition_data->local_partition_id);
 	for (auto &field : partition_data->fields) {
 		DuckLakePartitionFieldInfo partition_field;
 		partition_field.partition_key_index = field.partition_key_index;
@@ -1298,7 +1303,6 @@ DuckLakePartitionInfo DuckLakeTransaction::GetNewPartitionKey(DuckLakeCommitStat
 		}
 		partition_key.fields.push_back(std::move(partition_field));
 	}
-	commit_state.committed_partition_ids[local_partition_id] = partition_id;
 	return partition_key;
 }
 
@@ -1316,9 +1320,7 @@ DuckLakeSortInfo DuckLakeTransaction::GetNewSortKey(DuckLakeCommitState &commit_
 		return sort_key;
 	}
 
-	auto sort_id = commit_state.commit_snapshot.next_catalog_id++;
-	sort_key.id = sort_id;
-	sort_data->sort_id = sort_id;
+	sort_key.id = CommitSpecId(commit_state, sort_data->sort_id, sort_data->local_sort_id);
 	for (auto &field : sort_data->fields) {
 		DuckLakeSortFieldInfo sort_field;
 		sort_field.sort_key_index = field.sort_key_index;
@@ -1492,6 +1494,7 @@ DuckLakeFileInfo DuckLakeTransaction::BuildDataFileInfo(const DuckLakeDataFile &
 	data_file.footer_size = file.footer_size;
 	data_file.row_group_count = file.row_group_count;
 	data_file.partition_id = file.partition_id;
+	data_file.sort_id = file.sort_id;
 	data_file.encryption_key = file.encryption_key;
 	data_file.row_id_start = row_id_start;
 	data_file.mapping_id = file.mapping_id;
@@ -1885,6 +1888,7 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 	context.write_snapshot = ChangesMade();
 	context.commit_info = state->commit_info;
 	context.supports_v1_1_metadata = ducklake_catalog.SupportsV1_1Metadata();
+	context.supports_v2_0_metadata = ducklake_catalog.SupportsV2_0Metadata();
 	context.snapshot_and_stats_query =
 	    metadata_manager->GetSnapshotAndStatsAndChangesQuery(transaction_snapshot, context.supports_v1_1_metadata);
 	state->Commit(transaction_snapshot, transaction_changes, retry_config, context);

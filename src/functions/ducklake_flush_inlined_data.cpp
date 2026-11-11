@@ -58,10 +58,11 @@ static void AttachDeleteFilesToWrittenFiles(vector<DuckLakeDeleteFile> &delete_f
 //===--------------------------------------------------------------------===//
 DuckLakeFlushData::DuckLakeFlushData(PhysicalPlan &physical_plan, const vector<LogicalType> &types,
                                      DuckLakeTableEntry &table, DuckLakeInlinedTableInfo inlined_table_p,
-                                     string encryption_key_p, optional_idx partition_id, PhysicalOperator &child)
+                                     string encryption_key_p, optional_idx partition_id, optional_idx sort_id,
+                                     PhysicalOperator &child)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 0), table(table),
       inlined_table(std::move(inlined_table_p)), encryption_key(std::move(encryption_key_p)),
-      partition_id(partition_id) {
+      partition_id(partition_id), sort_id(sort_id) {
 	children.push_back(child);
 }
 
@@ -91,7 +92,7 @@ unique_ptr<GlobalSinkState> DuckLakeFlushData::GetGlobalSinkState(ClientContext 
 
 SinkResultType DuckLakeFlushData::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	DuckLakeInsert::AddWrittenFiles(global_state, chunk, encryption_key, partition_id, true);
+	DuckLakeInsert::AddWrittenFiles(global_state, chunk, encryption_key, partition_id, sort_id, true);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -230,12 +231,14 @@ public:
 	DuckLakeInlinedTableInfo inlined_table;
 	string encryption_key;
 	optional_idx partition_id;
+	optional_ptr<DuckLakeSort> sort;
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
 		auto &child = planner.CreatePlan(*children[0]);
+		auto sort_id = DuckLakeInsert::PlanSortedCopy(child, sort);
 		return planner.Make<DuckLakeFlushData>(types, table, std::move(inlined_table), std::move(encryption_key),
-		                                       partition_id, child);
+		                                       partition_id, sort_id, child);
 	}
 
 	string GetName() const override {
@@ -265,7 +268,7 @@ public:
 	unique_ptr<LogicalOperator> GenerateFlushCommand();
 
 private:
-	string GetFlushSortOrderSQL(const DuckLakeTableEntry &table);
+	string GetFlushSortOrderSQL(const DuckLakeTableEntry &table, optional_ptr<DuckLakeSort> &sort);
 
 	ClientContext &context;
 	DuckLakeCatalog &catalog;
@@ -282,7 +285,7 @@ DuckLakeDataFlusher::DuckLakeDataFlusher(ClientContext &context, DuckLakeCatalog
       inlined_table(inlined_table_p) {
 }
 
-string DuckLakeDataFlusher::GetFlushSortOrderSQL(const DuckLakeTableEntry &table) {
+string DuckLakeDataFlusher::GetFlushSortOrderSQL(const DuckLakeTableEntry &table, optional_ptr<DuckLakeSort> &sort) {
 	// use the latest sort setting, including one set earlier in this transaction
 	auto &latest_table = DuckLakeCompactor::GetLatestTableEntry(catalog, transaction, table);
 	auto sort_data = latest_table.GetSortData();
@@ -299,7 +302,11 @@ string DuckLakeDataFlusher::GetFlushSortOrderSQL(const DuckLakeTableEntry &table
 			return string();
 		}
 	}
-	return DuckLakeSort::BuildSortOrderSQL(context, bound_orders, latest_table, table);
+	auto sort_order_sql = DuckLakeSort::BuildSortOrderSQL(context, bound_orders, latest_table, table);
+	if (!sort_order_sql.empty()) {
+		sort = sort_data;
+	}
+	return sort_order_sql;
 }
 
 unique_ptr<LogicalOperator> DuckLakeDataFlusher::GenerateFlushCommand() {
@@ -309,7 +316,8 @@ unique_ptr<LogicalOperator> DuckLakeDataFlusher::GenerateFlushCommand() {
 	}
 	auto &table = *table_entry;
 
-	auto sort_order_sql = GetFlushSortOrderSQL(table);
+	optional_ptr<DuckLakeSort> sort;
+	auto sort_order_sql = GetFlushSortOrderSQL(table, sort);
 	optional_idx partition_id;
 	auto partition_data = table.GetPartitionData();
 	if (partition_data) {
@@ -333,6 +341,7 @@ unique_ptr<LogicalOperator> DuckLakeDataFlusher::GenerateFlushCommand() {
 	// followed by the compaction operator (that writes the results back to the
 	auto compaction = make_uniq<DuckLakeLogicalFlush>(binder.GenerateTableIndex(), table, inlined_table,
 	                                                  std::move(copy_input.encryption_key), partition_id);
+	compaction->sort = sort;
 	compaction->children.push_back(std::move(copy));
 	return std::move(compaction);
 }

@@ -696,6 +696,7 @@ string DuckLakeMetadataManager::GetSnapshotTagTableStatement() {
 
 void DuckLakeMetadataManager::MigrateV11() {
 	auto migrate_query = GetSnapshotTagTableStatement() + R"(
+ALTER TABLE {METADATA_CATALOG}.ducklake_data_file ADD COLUMN {IF_NOT_EXISTS} sort_id BIGINT;
 UPDATE {METADATA_CATALOG}.ducklake_metadata SET value = '2.0-dev1' WHERE key = 'version';
 )";
 	ExecuteMigration(migrate_query, false, "1.1", "2.0-dev1");
@@ -4555,6 +4556,7 @@ string DuckLakeMetadataManager::WriteNewDataFilesWithAppender(DuckLakeSnapshot &
 	Appender variant_stats_appender(connection, db_name, schema_name, "ducklake_file_variant_stats");
 
 	bool supports_v1_1_metadata = catalog.SupportsV1_1Metadata();
+	bool supports_v2_0_metadata = catalog.SupportsV2_0Metadata();
 	for (auto &file : new_files) {
 		auto data_file_index = static_cast<int64_t>(file.id.index);
 		auto table_id = static_cast<int64_t>(file.table_id.index);
@@ -4566,7 +4568,7 @@ string DuckLakeMetadataManager::WriteNewDataFilesWithAppender(DuckLakeSnapshot &
 		// ducklake_data_file columns:
 		// data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative,
 		// file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id,
-		// encryption_key, mapping_id, partial_max, row_group_count (>= 1.1)
+		// encryption_key, mapping_id, partial_max, row_group_count (>= 1.1), sort_id (>= 2.0)
 		data_file_appender.BeginRow();
 		data_file_appender.Append<int64_t>(data_file_index);                            // data_file_id
 		data_file_appender.Append<int64_t>(table_id);                                   // table_id
@@ -4591,6 +4593,9 @@ string DuckLakeMetadataManager::WriteNewDataFilesWithAppender(DuckLakeSnapshot &
 		AppendBigintOrNull(data_file_appender, file.max_partial_file_snapshot);
 		if (supports_v1_1_metadata) {
 			AppendBigintOrNull(data_file_appender, file.row_group_count);
+		}
+		if (supports_v2_0_metadata) {
+			AppendBigintOrNull(data_file_appender, file.sort_id);
 		}
 		data_file_appender.EndRow();
 
@@ -4685,7 +4690,7 @@ bool DuckLakeMetadataManager::TryAppendDataFiles(DuckLakeSnapshot &commit_snapsh
 
 string DuckLakeMetadataManager::WriteNewDataFilesSqlBatch(const vector<DuckLakeFileInfo> &new_files,
                                                           const vector<DuckLakePath> &resolved_paths,
-                                                          bool supports_v1_1_metadata) {
+                                                          bool supports_v1_1_metadata, bool supports_v2_0_metadata) {
 	if (new_files.empty()) {
 		// LCOV_EXCL_START
 		return string();
@@ -4716,6 +4721,9 @@ string DuckLakeMetadataManager::WriteNewDataFilesSqlBatch(const vector<DuckLakeF
 		    file.file_size_bytes, footer_size, row_id, partition_id, encryption_key, mapping, partial_max);
 		if (supports_v1_1_metadata) {
 			data_file_value += ", " + DuckLakeUtil::OptionalIdxOrNull(file.row_group_count);
+		}
+		if (supports_v2_0_metadata) {
+			data_file_value += ", " + DuckLakeUtil::OptionalIdxOrNull(file.sort_id);
 		}
 		data_file_values.push_back(data_file_value + ")");
 		for (auto &raw_stats : file.column_stats) {
@@ -5276,28 +5284,74 @@ static unordered_map<idx_t, T> GetChangedSpecs(const vector<T> &old_specs, const
 	return new_spec_map;
 }
 
-unordered_map<idx_t, idx_t>
-DuckLakeMetadataManager::GetUnchangedPartitionIds(const vector<DuckLakePartitionInfo> &existing_partitions,
-                                                  const vector<DuckLakePartitionInfo> &new_partitions) {
-	unordered_map<idx_t, idx_t> last_partition_index;
-	unordered_set<idx_t> replaced_tables;
-	for (idx_t i = 0; i < new_partitions.size(); i++) {
-		last_partition_index[new_partitions[i].table_id.index] = i;
-		if (new_partitions[i].replaces_equal_spec) {
-			replaced_tables.insert(new_partitions[i].table_id.index);
+static bool ReplacesEqualSpec(const DuckLakePartitionInfo &spec) {
+	// a bucket column changed type, so the last spec replaces the current one even with the same fields
+	return spec.replaces_equal_spec;
+}
+
+static bool ReplacesEqualSpec(const DuckLakeSortInfo &spec) {
+	return false;
+}
+
+//! Appends the specs a commit writes and returns the tables whose current spec it ends
+template <class T, class APPEND_SPEC>
+static set<TableIndex> AppendNewSpecs(const vector<T> &existing_specs, const vector<T> &new_specs,
+                                      APPEND_SPEC &&append_spec) {
+	unordered_map<idx_t, idx_t> last_spec_index;
+	for (idx_t i = 0; i < new_specs.size(); i++) {
+		last_spec_index[new_specs[i].table_id.index] = i;
+	}
+	for (idx_t i = 0; i < new_specs.size(); i++) {
+		auto &spec = new_specs[i];
+		if (i != last_spec_index[spec.table_id.index] && !spec.fields.empty()) {
+			// Files written before another spec change in the same transaction can still reference this spec.
+			append_spec(spec, "{SNAPSHOT_ID}");
 		}
 	}
-	unordered_map<idx_t, idx_t> result;
-	for (auto &existing : existing_partitions) {
-		auto entry = last_partition_index.find(existing.table_id.index);
-		if (entry == last_partition_index.end() || replaced_tables.count(existing.table_id.index)) {
+
+	auto changed_specs = GetChangedSpecs(existing_specs, new_specs);
+	for (auto &spec : new_specs) {
+		if (ReplacesEqualSpec(spec)) {
+			changed_specs[spec.table_id.index] = new_specs[last_spec_index[spec.table_id.index]];
+		}
+	}
+	set<TableIndex> altered_tables;
+	for (auto &changed_spec : changed_specs) {
+		altered_tables.insert(changed_spec.second.table_id);
+		append_spec(changed_spec.second, "NULL");
+	}
+	return altered_tables;
+}
+
+template <class T>
+static void AddUnchangedSpecIds(const vector<T> &existing_specs, const vector<T> &new_specs,
+                                unordered_map<idx_t, idx_t> &result) {
+	unordered_map<idx_t, idx_t> last_spec_index;
+	unordered_set<idx_t> replaced_tables;
+	for (idx_t i = 0; i < new_specs.size(); i++) {
+		last_spec_index[new_specs[i].table_id.index] = i;
+		if (ReplacesEqualSpec(new_specs[i])) {
+			replaced_tables.insert(new_specs[i].table_id.index);
+		}
+	}
+	for (auto &existing : existing_specs) {
+		auto entry = last_spec_index.find(existing.table_id.index);
+		if (entry == last_spec_index.end() || replaced_tables.count(existing.table_id.index)) {
 			continue;
 		}
-		auto &last = new_partitions[entry->second];
+		auto &last = new_specs[entry->second];
 		if (last.id.IsValid() && existing.id.IsValid() && last == existing) {
 			result[last.id.GetIndex()] = existing.id.GetIndex();
 		}
 	}
+}
+
+unordered_map<idx_t, idx_t> DuckLakeMetadataManager::GetUnchangedSpecIds(
+    const vector<DuckLakePartitionInfo> &existing_partitions, const vector<DuckLakePartitionInfo> &new_partitions,
+    const vector<DuckLakeSortInfo> &existing_sorts, const vector<DuckLakeSortInfo> &new_sorts) {
+	unordered_map<idx_t, idx_t> result;
+	AddUnchangedSpecIds(existing_partitions, new_partitions, result);
+	AddUnchangedSpecIds(existing_sorts, new_sorts, result);
 	return result;
 }
 
@@ -5325,30 +5379,7 @@ string DuckLakeMetadataManager::WriteNewPartitionKeys(const vector<DuckLakeParti
 		}
 	};
 
-	unordered_map<idx_t, idx_t> last_partition_index;
-	for (idx_t i = 0; i < new_partitions.size(); i++) {
-		last_partition_index[new_partitions[i].table_id.index] = i;
-	}
-	for (idx_t i = 0; i < new_partitions.size(); i++) {
-		auto &partition = new_partitions[i];
-		if (i != last_partition_index[partition.table_id.index] && !partition.fields.empty()) {
-			// Files written before another partition change in the same transaction can still reference this spec.
-			append_partition(partition, "{SNAPSHOT_ID}");
-		}
-	}
-
-	auto changed_specs = GetChangedSpecs(existing_partitions, new_partitions);
-	for (auto &partition : new_partitions) {
-		if (partition.replaces_equal_spec) {
-			// a bucket column changed type, so the last spec replaces the current one even with the same fields
-			changed_specs[partition.table_id.index] = new_partitions[last_partition_index[partition.table_id.index]];
-		}
-	}
-	set<TableIndex> altered_tables;
-	for (auto &new_partition : changed_specs) {
-		altered_tables.insert(new_partition.second.table_id);
-		append_partition(new_partition.second, "NULL");
-	}
+	auto altered_tables = AppendNewSpecs(existing_partitions, new_partitions, append_partition);
 	return FlushDrop("ducklake_partition_info", "table_id", altered_tables) +
 	       InsertValuesSql("ducklake_partition_info", partition_values) +
 	       InsertValuesSql("ducklake_partition_column", partition_columns);
@@ -5360,27 +5391,26 @@ string DuckLakeMetadataManager::WriteNewSortKeys(const vector<DuckLakeSortInfo> 
 		return {};
 	}
 
-	set<TableIndex> altered_tables;
 	vector<string> sort_values;
 	vector<string> sort_expressions;
-	for (auto &new_sort : GetChangedSpecs(existing_sorts, new_sorts)) {
-		altered_tables.insert(new_sort.second.table_id);
-		if (!new_sort.second.id.IsValid()) {
+	auto append_sort = [&](const DuckLakeSortInfo &sort, const string &end_snapshot) {
+		if (!sort.id.IsValid()) {
 			// dropping sort data - skip adding new values but continue to set end_snapshot on old sort
-			continue;
+			return;
 		}
-		auto sort_id = new_sort.second.id.GetIndex();
+		auto sort_id = sort.id.GetIndex();
 		sort_values.push_back(
-		    StringUtil::Format(R"((%d, %d, {SNAPSHOT_ID}, NULL))", sort_id, new_sort.second.table_id.index));
-		for (auto &field : new_sort.second.fields) {
+		    StringUtil::Format("(%d, %d, {SNAPSHOT_ID}, %s)", sort_id, sort.table_id.index, end_snapshot));
+		for (auto &field : sort.fields) {
 			string sort_direction = (field.sort_direction == OrderType::DESCENDING ? "DESC" : "ASC");
 			string null_order = (field.null_order == OrderByNullType::NULLS_FIRST ? "NULLS_FIRST" : "NULLS_LAST");
-			sort_expressions.push_back(StringUtil::Format("(%d, %d, %d, %s, %s, %s, %s)", sort_id,
-			                                              new_sort.second.table_id.index, field.sort_key_index,
-			                                              SQLString(field.expression), SQLString(field.dialect),
-			                                              SQLString(sort_direction), SQLString(null_order)));
+			sort_expressions.push_back(StringUtil::Format("(%d, %d, %d, %s, %s, %s, %s)", sort_id, sort.table_id.index,
+			                                              field.sort_key_index, SQLString(field.expression),
+			                                              SQLString(field.dialect), SQLString(sort_direction),
+			                                              SQLString(null_order)));
 		}
-	}
+	};
+	auto altered_tables = AppendNewSpecs(existing_sorts, new_sorts, append_sort);
 	return FlushDrop("ducklake_sort_info", "table_id", altered_tables) +
 	       InsertValuesSql("ducklake_sort_info", sort_values) +
 	       InsertValuesSql("ducklake_sort_expression", sort_expressions);

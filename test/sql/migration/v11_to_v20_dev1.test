@@ -21,6 +21,24 @@ SELECT * FROM meta.ducklake_snapshot_tag
 ----
 does not exist
 
+# a 1.1 catalog has no sort_id column, and sorted inserts still commit
+statement ok
+CALL dl.set_option('data_inlining_row_limit', 0)
+
+statement ok
+ALTER TABLE dl.t SET SORTED BY (i)
+
+statement ok
+INSERT INTO dl.t VALUES (43)
+
+statement error
+SELECT sort_id FROM meta.ducklake_data_file
+----
+sort_id
+
+statement ok
+DELETE FROM dl.t WHERE i = 43
+
 statement ok
 DETACH dl
 
@@ -64,6 +82,26 @@ query I
 SELECT * FROM dl.t
 ----
 42
+
+# files written before the migration have an unknown sort order
+query I
+SELECT count(*) FROM meta.ducklake_data_file WHERE sort_id IS NOT NULL
+----
+0
+
+statement ok
+INSERT INTO dl.t VALUES (1), (0)
+
+statement ok
+SET VARIABLE t_sort_id = (SELECT sort_id FROM meta.ducklake_sort_info WHERE end_snapshot IS NULL)
+
+query I
+SELECT count(*) FROM meta.ducklake_data_file WHERE sort_id = getvariable('t_sort_id')
+----
+1
+
+statement ok
+DELETE FROM dl.t WHERE i < 2
 
 statement ok
 DETACH dl

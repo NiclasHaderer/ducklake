@@ -1,0 +1,424 @@
+# name: test/sql/sorted_table/data_file_sort_id.test
+# description: every data file records the sort spec its rows are ordered by
+# group: [sorted_table]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/data_file_sort_id.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS dl (DATA_PATH '{DATA_PATH}/data_file_sort_id', METADATA_CATALOG 'meta', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+USE dl
+
+# an unsorted table writes files with an unknown order
+statement ok
+CREATE TABLE unsorted(i INTEGER)
+
+statement ok
+INSERT INTO unsorted VALUES (3), (1), (2)
+
+query I
+SELECT count(*) FROM meta.ducklake_data_file WHERE sort_id IS NOT NULL
+----
+0
+
+# a sorted insert records the sort spec of the table
+statement ok
+CREATE TABLE t(i INTEGER)
+
+statement ok
+ALTER TABLE t SET SORTED BY (i)
+
+statement ok
+INSERT INTO t VALUES (3), (1), (2)
+
+statement ok
+SET VARIABLE t_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 't')
+
+statement ok
+SET VARIABLE sort_1 = (SELECT sort_id FROM meta.ducklake_sort_info WHERE table_id = getvariable('t_id') AND end_snapshot IS NULL)
+
+query I
+SELECT list(sort_id) = [getvariable('sort_1')] FROM meta.ducklake_data_file WHERE table_id = getvariable('t_id')
+----
+true
+
+# a new sort spec applies to new files only
+statement ok
+ALTER TABLE t SET SORTED BY (i DESC)
+
+statement ok
+INSERT INTO t VALUES (5), (4)
+
+statement ok
+SET VARIABLE sort_2 = (SELECT sort_id FROM meta.ducklake_sort_info WHERE table_id = getvariable('t_id') AND end_snapshot IS NULL)
+
+query I
+SELECT getvariable('sort_1') <> getvariable('sort_2')
+----
+true
+
+query I
+SELECT list(sort_id ORDER BY data_file_id) = [getvariable('sort_1'), getvariable('sort_2')] FROM meta.ducklake_data_file WHERE table_id = getvariable('t_id')
+----
+true
+
+# setting the committed spec again keeps its id
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE t SET SORTED BY (i ASC)
+
+statement ok
+ALTER TABLE t SET SORTED BY (i DESC)
+
+statement ok
+INSERT INTO t VALUES (7), (6)
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM meta.ducklake_data_file WHERE table_id = getvariable('t_id') AND sort_id = getvariable('sort_2')
+----
+2
+
+query I
+SELECT sort_id = getvariable('sort_2') FROM meta.ducklake_sort_info WHERE table_id = getvariable('t_id') AND end_snapshot IS NULL
+----
+true
+
+# a spec set in the same transaction as the insert gets its committed id
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE tx(i INTEGER)
+
+statement ok
+ALTER TABLE tx SET SORTED BY (i)
+
+statement ok
+INSERT INTO tx VALUES (2), (1)
+
+statement ok
+COMMIT
+
+statement ok
+SET VARIABLE tx_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'tx')
+
+statement ok
+SET VARIABLE tx_sort = (SELECT sort_id FROM meta.ducklake_sort_info WHERE table_id = getvariable('tx_id') AND end_snapshot IS NULL)
+
+query I
+SELECT list(sort_id) = [getvariable('tx_sort')] FROM meta.ducklake_data_file WHERE table_id = getvariable('tx_id')
+----
+true
+
+# CREATE TABLE AS with an inline sort spec
+statement ok
+CREATE TABLE ctas SORTED BY (i) AS SELECT range AS i FROM range(5)
+
+statement ok
+SET VARIABLE ctas_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'ctas')
+
+statement ok
+SET VARIABLE ctas_sort = (SELECT sort_id FROM meta.ducklake_sort_info WHERE table_id = getvariable('ctas_id') AND end_snapshot IS NULL)
+
+query I
+SELECT list(sort_id) = [getvariable('ctas_sort')] FROM meta.ducklake_data_file WHERE table_id = getvariable('ctas_id')
+----
+true
+
+# without sort_on_insert the files are unsorted until compaction sorts them
+statement ok
+CREATE TABLE nosort(i INTEGER)
+
+statement ok
+ALTER TABLE nosort SET SORTED BY (i)
+
+statement ok
+CALL dl.set_option('sort_on_insert', 'false', table_name => 'nosort')
+
+statement ok
+INSERT INTO nosort VALUES (3), (1)
+
+statement ok
+INSERT INTO nosort VALUES (4), (2)
+
+statement ok
+SET VARIABLE nosort_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'nosort')
+
+statement ok
+SET VARIABLE nosort_sort = (SELECT sort_id FROM meta.ducklake_sort_info WHERE table_id = getvariable('nosort_id') AND end_snapshot IS NULL)
+
+query II
+SELECT count(*), count(sort_id) FROM meta.ducklake_data_file WHERE table_id = getvariable('nosort_id') AND end_snapshot IS NULL
+----
+2	0
+
+statement ok
+CALL ducklake_merge_adjacent_files('dl', 'nosort')
+
+query I
+SELECT list(sort_id) = [getvariable('nosort_sort')] FROM meta.ducklake_data_file WHERE table_id = getvariable('nosort_id') AND end_snapshot IS NULL
+----
+true
+
+query I
+SELECT i FROM nosort
+----
+1
+2
+3
+4
+
+# flushing inlined rows of a sorted table writes a sorted file
+statement ok
+CREATE TABLE inl(i INTEGER)
+
+statement ok
+ALTER TABLE inl SET SORTED BY (i)
+
+statement ok
+CALL dl.set_option('data_inlining_row_limit', 100, table_name => 'inl')
+
+statement ok
+INSERT INTO inl VALUES (3), (1), (2)
+
+statement ok
+SET VARIABLE inl_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'inl')
+
+query I
+SELECT count(*) FROM meta.ducklake_data_file WHERE table_id = getvariable('inl_id')
+----
+0
+
+statement ok
+CALL ducklake_flush_inlined_data('dl', table_name => 'inl')
+
+statement ok
+SET VARIABLE inl_sort = (SELECT sort_id FROM meta.ducklake_sort_info WHERE table_id = getvariable('inl_id') AND end_snapshot IS NULL)
+
+query I
+SELECT list(sort_id) = [getvariable('inl_sort')] FROM meta.ducklake_data_file WHERE table_id = getvariable('inl_id')
+----
+true
+
+query I
+SELECT i FROM inl ORDER BY file_row_number
+----
+1
+2
+3
+
+# files written under a spec the transaction replaces reference a written spec
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE chg(i INTEGER, j INTEGER)
+
+statement ok
+ALTER TABLE chg SET SORTED BY (i)
+
+statement ok
+INSERT INTO chg VALUES (2, 1), (1, 2)
+
+statement ok
+ALTER TABLE chg SET SORTED BY (j)
+
+statement ok
+INSERT INTO chg VALUES (4, 3), (3, 4)
+
+statement ok
+COMMIT
+
+statement ok
+SET VARIABLE chg_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'chg')
+
+statement ok
+SET VARIABLE chg_sorts = (SELECT list(sort_id ORDER BY sort_id) FROM meta.ducklake_sort_info WHERE table_id = getvariable('chg_id'))
+
+query I
+SELECT list(sort_id ORDER BY data_file_id) = getvariable('chg_sorts') FROM meta.ducklake_data_file WHERE table_id = getvariable('chg_id')
+----
+true
+
+query II
+SELECT count(*), count(end_snapshot) FROM meta.ducklake_sort_info WHERE table_id = getvariable('chg_id')
+----
+2	1
+
+# also when it resets the spec
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE rst(i INTEGER)
+
+statement ok
+ALTER TABLE rst SET SORTED BY (i)
+
+statement ok
+INSERT INTO rst VALUES (2), (1)
+
+statement ok
+ALTER TABLE rst RESET SORTED BY
+
+statement ok
+COMMIT
+
+statement ok
+SET VARIABLE rst_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'rst')
+
+statement ok
+SET VARIABLE rst_sorts = (SELECT list(sort_id) FROM meta.ducklake_sort_info WHERE table_id = getvariable('rst_id'))
+
+query II
+SELECT list(sort_id) = getvariable('rst_sorts'), len(getvariable('rst_sorts')) FROM meta.ducklake_data_file WHERE table_id = getvariable('rst_id')
+----
+true	1
+
+# and when a rename rewrites the committed spec before another change
+statement ok
+CREATE TABLE ren(i INTEGER, j INTEGER)
+
+statement ok
+ALTER TABLE ren SET SORTED BY (i)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO ren VALUES (2, 1), (1, 2)
+
+statement ok
+ALTER TABLE ren RENAME COLUMN i TO k
+
+statement ok
+INSERT INTO ren VALUES (4, 3), (3, 4)
+
+statement ok
+ALTER TABLE ren SET SORTED BY (j)
+
+statement ok
+INSERT INTO ren VALUES (6, 5), (5, 6)
+
+statement ok
+COMMIT
+
+statement ok
+SET VARIABLE ren_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'ren')
+
+statement ok
+SET VARIABLE ren_sorts = (SELECT list(sort_id) FROM meta.ducklake_sort_info WHERE table_id = getvariable('ren_id'))
+
+query II
+SELECT count(*), count(*) FILTER (WHERE list_contains(getvariable('ren_sorts'), sort_id)) FROM meta.ducklake_data_file WHERE table_id = getvariable('ren_id')
+----
+3	3
+
+# every sorted file is in the order of its spec
+query II
+SELECT k, j FROM ren ORDER BY rowid
+----
+1	2
+2	1
+3	4
+4	3
+6	5
+5	6
+
+# a rewrite through the rotating copy records the spec and writes in order
+statement ok
+CREATE TABLE rw(i INTEGER)
+
+statement ok
+CALL dl.set_option('sort_on_insert', 'false', table_name => 'rw')
+
+statement ok
+ALTER TABLE rw SET SORTED BY (i)
+
+statement ok
+INSERT INTO rw SELECT (i * 7919) % 1009 FROM range(1000) t(i)
+
+statement ok
+DELETE FROM rw WHERE i % 10 = 3
+
+statement ok
+CALL ducklake_rewrite_data_files('dl', 'rw', delete_threshold => 0)
+
+statement ok
+SET VARIABLE rw_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'rw')
+
+statement ok
+SET VARIABLE rw_sort = (SELECT sort_id FROM meta.ducklake_sort_info WHERE table_id = getvariable('rw_id') AND end_snapshot IS NULL)
+
+query I
+SELECT list(sort_id) = [getvariable('rw_sort')] FROM meta.ducklake_data_file WHERE table_id = getvariable('rw_id') AND end_snapshot IS NULL
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT i < lag(i) OVER (PARTITION BY filename ORDER BY file_row_number) AS out_of_order FROM rw) WHERE out_of_order
+----
+0
+
+# partitioned writes interleave the sorted rows, so their order is unknown
+statement ok
+CREATE TABLE part(p INTEGER, i INTEGER)
+
+statement ok
+ALTER TABLE part SET PARTITIONED BY (p)
+
+statement ok
+ALTER TABLE part SET SORTED BY (i)
+
+statement ok
+INSERT INTO part SELECT i % 2, i FROM range(1000) t(i)
+
+statement ok
+SET VARIABLE part_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'part')
+
+query II
+SELECT count(*), count(sort_id) FROM meta.ducklake_data_file WHERE table_id = getvariable('part_id')
+----
+2	0
+
+# a sort key in another dialect is not sorted by, so the files are only partially sorted
+statement ok
+CREATE TABLE dia(i INTEGER, j INTEGER)
+
+statement ok
+ALTER TABLE dia SET SORTED BY (i, j)
+
+statement ok
+SET VARIABLE dia_id = (SELECT table_id FROM meta.ducklake_table WHERE table_name = 'dia')
+
+statement ok
+UPDATE meta.ducklake_sort_expression SET dialect = 'spark' WHERE table_id = getvariable('dia_id') AND sort_key_index = 0
+
+statement ok
+USE memory
+
+statement ok
+DETACH dl
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS dl (DATA_PATH '{DATA_PATH}/data_file_sort_id', METADATA_CATALOG 'meta', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+INSERT INTO dl.dia VALUES (2, 1), (1, 2)
+
+query I
+SELECT count(sort_id) FROM meta.ducklake_data_file WHERE table_id = getvariable('dia_id')
+----
+0

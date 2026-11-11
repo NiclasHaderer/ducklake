@@ -66,7 +66,8 @@ struct DuckLakeCommitState {
 	DuckLakeSnapshot &commit_snapshot;
 	map<SchemaIndex, SchemaIndex> committed_schemas;
 	map<TableIndex, TableIndex> committed_tables;
-	map<idx_t, idx_t> committed_partition_ids;
+	//! Transaction-local partition and sort spec ids to their committed ids; both share the catalog id space
+	map<idx_t, idx_t> committed_spec_ids;
 	map<MappingIndex, MappingIndex> committed_mapping_indexes;
 	map<TableIndex, vector<DuckLakeDeleteFile>> local_delete_files;
 	//! The columns this commit widens from FLOAT to DOUBLE
@@ -102,13 +103,13 @@ struct DuckLakeCommitState {
 			table_id = entry->second;
 		}
 	}
-	void RemapPartitionId(optional_idx &partition_id) const {
-		if (!partition_id.IsValid()) {
+	void RemapSpecId(optional_idx &spec_id) const {
+		if (!spec_id.IsValid()) {
 			return;
 		}
-		auto entry = committed_partition_ids.find(partition_id.GetIndex());
-		if (entry != committed_partition_ids.end()) {
-			partition_id = entry->second;
+		auto entry = committed_spec_ids.find(spec_id.GetIndex());
+		if (entry != committed_spec_ids.end()) {
+			spec_id = entry->second;
 		}
 	}
 	void RemapMappingIndex(MappingIndex &table_id) const {

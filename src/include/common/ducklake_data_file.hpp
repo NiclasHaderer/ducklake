@@ -69,6 +69,8 @@ struct DuckLakeDataFile {
 	optional_idx footer_size;
 	optional_idx row_group_count;
 	optional_idx partition_id;
+	//! The sort spec the rows of this file are ordered by, invalid when the order is unknown
+	optional_idx sort_id;
 	vector<DuckLakeDeleteFile> delete_files;
 	map<FieldIndex, DuckLakeColumnStats> column_stats;
 	vector<DuckLakeFilePartition> partition_values;

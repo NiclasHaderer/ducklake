@@ -158,7 +158,8 @@ static bool IsLeafColumnStats(const vector<Value> &col_stats) {
 }
 
 void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
-                                     const string &encryption_key, optional_idx partition_id, bool set_snapshot_id) {
+                                     const string &encryption_key, optional_idx partition_id, optional_idx sort_id,
+                                     bool set_snapshot_id) {
 	auto skipped_fields = global_state.table.GetSkippedStatsFields();
 	auto &field_data = global_state.table.GetFieldData();
 	auto snapshot_id_name = InternalColumnName(field_data, "_ducklake_internal_snapshot_id");
@@ -182,9 +183,8 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
 			}
 		}
 		data_file.encryption_key = encryption_key;
-		if (partition_id.IsValid()) {
-			data_file.partition_id = partition_id.GetIndex();
-		}
+		data_file.partition_id = partition_id;
+		data_file.sort_id = sort_id;
 
 		// extract the column stats
 		auto column_stats = chunk.GetValue(4, r);
@@ -293,7 +293,7 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
 
 SinkResultType DuckLakeInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	AddWrittenFiles(global_state, chunk, encryption_key, partition_id);
+	AddWrittenFiles(global_state, chunk, encryption_key, partition_id, sort_id);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -676,20 +676,28 @@ PhysicalOperator &DuckLakeInsert::PlanCopyForInsert(ClientContext &context, Phys
 
 	copy.SetEstimatedCardinality(1);
 	copy.ResolveOperatorTypes();
-	auto &physical_copy = planner.CreatePlan(copy, *plan).Cast<PhysicalCopyToFile>();
-	if (copy_input.ordered_input) {
-		PreserveSortedOrder(physical_copy);
-	}
-	return physical_copy;
+	return planner.CreatePlan(copy, *plan).Cast<PhysicalCopyToFile>();
 }
 
-void DuckLakeInsert::PreserveSortedOrder(PhysicalCopyToFile &physical_copy) {
+optional_idx DuckLakeInsert::PlanSortedCopy(PhysicalOperator &copy, optional_ptr<DuckLakeSort> sort) {
+	if (!sort) {
+		return optional_idx();
+	}
+	if (copy.type == PhysicalOperatorType::BATCH_COPY_TO_FILE) {
+		return sort->WrittenSortId();
+	}
+	auto &physical_copy = copy.Cast<PhysicalCopyToFile>();
 	if (!physical_copy.function.execution_mode) {
-		return;
+		return optional_idx();
 	}
 	// the rows are sorted and the batch copy operator does not rotate files by size
 	auto execution_mode = physical_copy.function.execution_mode(true, false);
 	physical_copy.parallel = execution_mode == CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
+	if (physical_copy.ParallelSink()) {
+		// partitioned and per-thread output sink in parallel regardless, interleaving the sorted rows
+		return optional_idx();
+	}
+	return sort->WrittenSortId();
 }
 
 PhysicalOperator &DuckLakeInsert::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
@@ -796,13 +804,13 @@ DuckLakeInsertPipeline DuckLakeInsert::PlanInsertPipeline(ClientContext &context
                                                           const ColumnList &columns, const Identifier &table_name,
                                                           optional_ptr<DuckLakeSort> sort_data, bool sort_on_insert,
                                                           idx_t data_inlining_row_limit) {
-	DuckLakeInsertPipeline result {plan, nullptr, false};
+	DuckLakeInsertPipeline result {plan, nullptr};
 	if (sort_data && sort_on_insert) {
 		auto sorted_plan = PlanInsertSort(context, planner, result.root.get(), schema, columns, table_name, *sort_data,
 		                                  result.sort_requires_rebind);
 		if (sorted_plan) {
 			result.root = *sorted_plan;
-			result.sorted = true;
+			result.sort = sort_data;
 		}
 	}
 	if (data_inlining_row_limit > 0) {
@@ -816,7 +824,7 @@ DuckLakeInsertPipeline DuckLakeInsert::PlanInsertPipeline(ClientContext &context
 			                                  *sort_data, result.sort_requires_rebind);
 			if (sorted_plan) {
 				result.root = *sorted_plan;
-				result.sorted = true;
+				result.sort = sort_data;
 			}
 		}
 	}
@@ -824,10 +832,12 @@ DuckLakeInsertPipeline DuckLakeInsert::PlanInsertPipeline(ClientContext &context
 }
 
 PhysicalOperator &DuckLakeInsertPipeline::AttachInsert(PhysicalOperator &insert, PhysicalOperator &copy) {
+	auto &ducklake_insert = insert.Cast<DuckLakeInsert>();
 	if (inline_data) {
-		inline_data->insert = insert.Cast<DuckLakeInsert>();
+		inline_data->insert = ducklake_insert;
 	}
-	insert.Cast<DuckLakeInsert>().sort_requires_rebind = sort_requires_rebind;
+	ducklake_insert.sort_requires_rebind = sort_requires_rebind;
+	ducklake_insert.sort_id = DuckLakeInsert::PlanSortedCopy(copy, sort);
 	insert.children.push_back(copy);
 	return insert;
 }
@@ -890,7 +900,6 @@ PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPl
 	    ducklake_table.GetSortData(), SortOnInsert(ducklake_table), GetInliningLimit(context, ducklake_table));
 
 	DuckLakeCopyInput copy_input(context, ducklake_table);
-	copy_input.ordered_input = pipeline.sorted;
 	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, pipeline.root.get());
 	auto &insert = DuckLakeInsert::PlanInsert(context, planner, ducklake_table, std::move(copy_input.encryption_key));
 	return pipeline.AttachInsert(insert, physical_copy);
@@ -928,7 +937,6 @@ PhysicalOperator &DuckLakeCatalog::PlanCreateTableAs(ClientContext &context, Phy
 
 	DuckLakeCopyInput copy_input(context, duck_schema, columns, table_data_path, *field_data, partition_data.get());
 	copy_input.table_options = table_options;
-	copy_input.ordered_input = pipeline.sorted;
 	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, pipeline.root.get());
 
 	auto &insert =
